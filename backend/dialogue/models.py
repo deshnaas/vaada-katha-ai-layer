@@ -17,6 +17,7 @@ FAILED = "FAILED"            # backend reported failure
 CANCELLED = "CANCELLED"
 EXPIRED = "EXPIRED"
 ABANDONED = "ABANDONED"      # too many failed clarification attempts
+REJECTED_BY_BACKEND = "REJECTED_BY_BACKEND"   # ledger-backend mode: the backend refused the confirmation
 
 # ---- kinds of turn result
 K_CONFIRMATION_PROMPT = "CONFIRMATION_PROMPT"
@@ -38,6 +39,8 @@ K_STALE_SIGNAL = "STALE_SIGNAL"
 K_EXECUTION_REPORTED = "EXECUTION_REPORTED"
 K_REMINDER = "REMINDER"
 K_DUPLICATE_REPLAY = "DUPLICATE_REPLAY"      # the SAME message id delivered again; never a fresh result
+K_BACKEND_ERROR = "BACKEND_ERROR"            # the ledger backend could not / would not do it; nothing was saved
+                                             # (or, for an unanswered confirm, it is NOT known to be saved)
 
 # ---- what a clarification slot still needs
 NEED_CUSTOMER = "CUSTOMER"
@@ -81,6 +84,14 @@ class PendingAction:
     date_text: Optional[str] = None
     known_customers: Optional[list] = None
     today: Optional[date] = None
+    # ledger-backend mode (only when a LedgerPort is configured): the backend proposal that this exact
+    # readback belongs to. It is valid ONLY while proposal_revision == revision; any change of the
+    # readback cancels it and requires a new proposal.
+    proposal_id: Optional[str] = None
+    proposal_prompt: Optional[str] = None        # the backend's own confirmation prompt (spoken)
+    proposal_revision: Optional[int] = None
+    confirm_unknown: bool = False                # a confirm call got no answer: outcome unknown, retry is safe
+    confirm_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,6 +108,7 @@ class PendingSnapshot:
     payment_method: Optional[str]
     needs: Tuple[str, ...]
     expires_at: float
+    proposal_id: Optional[str] = None            # backend proposal bound to this exact revision (API mode)
 
 
 @dataclass(frozen=True)
@@ -162,6 +174,10 @@ class TurnResult:
     queued: bool = False
     reason_codes: List[str] = field(default_factory=list)
     replay_of: Optional[str] = None          # set only when kind == DUPLICATE_REPLAY
+    # Ledger-backend mode only: what the BACKEND committed for a confirmed action (transaction id,
+    # type, amount_paise and the backend's own balance). `execution_request` is then None: the
+    # transaction was executed by the backend, so no consumer may execute anything again.
+    ledger_result: Optional[dict] = None
 
     def utterances(self) -> List[str]:
         """The sentences to speak for this turn, in order. Empty for a duplicate replay."""

@@ -18,6 +18,7 @@ from commands.context import AWAITING_CLARIFICATION as CTX_CLARIFYING
 from commands.context import AWAITING_CONFIRMATION as CTX_CONFIRMING
 
 from . import models as M
+from . import ports as pt
 from . import prompts as P
 
 _WRITE = {"ADD_CREDIT", "RECORD_PAYMENT", "SET_COMMITMENT"}
@@ -37,13 +38,22 @@ class DialogueManager:
     def __init__(self, ttl_seconds: float = 120.0, *, clock: Optional[Callable[[], float]] = None,
                  id_factory: Optional[Callable[[], str]] = None, max_clarifications: int = 3,
                  duplicate_window_seconds: float = 30.0, history_size: int = 50,
-                 interpreter: Optional[Callable] = None):
+                 interpreter: Optional[Callable] = None, ledger: Optional[pt.LedgerPort] = None,
+                 query_resolver: Optional[pt.QueryResolver] = None):
         """interpreter: optional rescue for sentences the rules cannot read, called as
         interpreter(text, deterministic_result, known_customers, today) -> IntentResult.
-        It only ever supplies the Hour 2 *reading*; every safety rule below still applies to it."""
+        It only ever supplies the Hour 2 *reading*; every safety rule below still applies to it.
+
+        ledger: optional LedgerPort (Phase 6). With it, every confirmable action first becomes a
+        BACKEND proposal; "haan" calls the backend's confirm and "nahi" its cancel, and the backend
+        (not this layer) commits the transaction. Without it the original behaviour is unchanged
+        (an ExecutionRequest hand-off). query_resolver answers balance/history questions from the
+        backend. Both are plain ports: this module contains no network code."""
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
         self._interpreter = interpreter
+        self._ledger = ledger
+        self._query_resolver = query_resolver
         self._ttl = float(ttl_seconds)
         self._clock = clock or time.monotonic
         self._new_id = id_factory or (lambda: "a_" + uuid.uuid4().hex[:12])
@@ -171,9 +181,9 @@ class DialogueManager:
                 if done.outcome in (M.CONFIRMED, M.EXECUTED, M.FAILED):
                     return self._seal(s, self._res(M.K_ALREADY_CONFIRMED, P.ALREADY_CONFIRMED,
                                                    duplicate=True, codes=["DUPLICATE_SIGNAL"]))
-                return self._seal(s, self._res(M.K_STALE_SIGNAL, P.WAS_CANCELLED
-                                               if done.outcome == M.CANCELLED else P.WAS_EXPIRED,
-                                               codes=["STALE_SIGNAL"]))
+                text = {M.CANCELLED: P.WAS_CANCELLED, M.ABANDONED: P.WAS_CANCELLED,
+                        M.REJECTED_BY_BACKEND: P.CONFIRM_REJECTED}.get(done.outcome, P.WAS_EXPIRED)
+                return self._seal(s, self._res(M.K_STALE_SIGNAL, text, codes=["STALE_SIGNAL"]))
             p = s.pending
             if p is None or p.action_id != action_id:
                 return self._seal(s, self._res(M.K_STALE_SIGNAL, P.NOTHING_PENDING,
@@ -214,7 +224,9 @@ class DialogueManager:
 
     def end_session(self, session_id: str) -> None:
         with self._lock:
-            self._sessions.pop(session_id, None)
+            s = self._sessions.pop(session_id, None)
+            if s is not None and s.pending is not None and s.pending.proposal_id:
+                self._cancel_remote(s.pending.proposal_id)         # never leave a proposal that could be confirmed
 
     # ================================================================== internals
     def _session(self, session_id) -> M.Session:
@@ -250,16 +262,26 @@ class DialogueManager:
             action_id=p.action_id, revision=p.revision, state=p.state, intent=p.intent,
             customer_name=p.customer_name, customer_id=p.customer_id, amount_paise=p.amount_paise,
             transaction_type=p.transaction_type, payment_method=p.payment_method,
-            needs=tuple(p.needs), expires_at=p.expires_at)
+            needs=tuple(p.needs), expires_at=p.expires_at, proposal_id=p.proposal_id)
 
     # ---- expiry / settling
     def _expire(self, s: M.Session, now: float) -> bool:
         p = s.pending
         if p is not None and now >= p.expires_at:
-            self._settle(s, p, M.EXPIRED, now)
+            outcome, notice = M.EXPIRED, P.EXPIRED_NOTICE
+            if self._ledger is not None and p.proposal_id:
+                # Cancelling at the backend also tells us the truth about an unanswered confirm:
+                # "already committed" means it WAS saved, so it must not be reported as expired.
+                res = self._cancel_remote(p.proposal_id)
+                p.proposal_id = None
+                if res.kind == pt.X_ALREADY_CONFIRMED:
+                    outcome, notice = M.EXECUTED, P.EXPIRED_BUT_SAVED
+                elif res.kind == pt.X_UNKNOWN and p.confirm_unknown:
+                    notice = P.EXPIRED_UNCERTAIN
+            self._settle(s, p, outcome, now)
             s.queued = None                   # a follow-up that old is stale too
             s.current_customer = None
-            s.notice = P.EXPIRED_NOTICE
+            s.notice = notice
             return True
         return False
 
@@ -268,6 +290,9 @@ class DialogueManager:
 
     def _settle(self, s: M.Session, p: M.PendingAction, outcome: str, now: float,
                 summary: str = "") -> None:
+        if self._ledger is not None and p.proposal_id and outcome not in (M.CONFIRMED, M.EXECUTED):
+            self._cancel_remote(p.proposal_id)           # an action that did not complete must not stay confirmable
+            p.proposal_id = None
         rec = M.Settled(p.action_id, p.revision, outcome, p.intent, now, summary)
         s.settled[p.action_id] = rec
         while len(s.settled) > self._history:
@@ -328,6 +353,8 @@ class DialogueManager:
                              codes=["DUPLICATE_CONFIRM"])
         if ls is not None and ls.outcome in (M.CANCELLED, M.ABANDONED) and recent:
             return self._res(M.K_NOTHING_PENDING, P.WAS_CANCELLED, codes=["CANCELLED"])
+        if ls is not None and ls.outcome == M.REJECTED_BY_BACKEND and recent:
+            return self._res(M.K_NOTHING_PENDING, P.CONFIRM_REJECTED, codes=["REJECTED_BY_BACKEND"])
         return self._res(M.K_NOTHING_PENDING, P.NOTHING_PENDING, codes=["NOTHING_PENDING"])
 
     # ---- CONFIRM
@@ -353,6 +380,8 @@ class DialogueManager:
         if p.prompted_revision != p.revision:       # nobody was asked about THIS revision
             return self._res(M.K_REJECTED, P.BAD_INPUT + " " + self._reminder(p),
                              codes=["NO_PROMPT_ISSUED"])
+        if self._ledger is not None:                # Phase 6: the BACKEND commits, via its proposal
+            return self._confirm_remote(s, p, now)
         try:
             req = self._build_request(s, p, now)
         except _Unexecutable as exc:
@@ -407,9 +436,22 @@ class DialogueManager:
 
     def _do_cancel(self, s, now) -> M.TurnResult:
         p = s.pending
+        message, codes = P.CANCELLED, ["CANCELLED"]
+        if self._ledger is not None and p.proposal_id:
+            out = self._cancel_remote(p.proposal_id)
+            p.proposal_id = None
+            if out.kind == pt.X_ALREADY_CONFIRMED:
+                # an unanswered confirm had in fact gone through: say so, do not pretend it was cancelled
+                self._settle(s, p, M.EXECUTED, now)
+                result = self._res(M.K_ALREADY_CONFIRMED, P.CANCEL_TOO_LATE, duplicate=True,
+                                   codes=["ALREADY_COMMITTED"])
+                self._promote_queued(s, result, now)
+                return result
+            if out.kind == pt.X_UNKNOWN:
+                message, codes = P.CANCELLED + P.CANCEL_UNACKED, ["CANCELLED", "CANCEL_NOT_ACKNOWLEDGED"]
         self._settle(s, p, M.CANCELLED, now)
         s.current_customer = None       # a cancelled entry must not lend its customer to "usne..."
-        result = self._res(M.K_CANCELLED, P.CANCELLED, codes=["CANCELLED"])
+        result = self._res(M.K_CANCELLED, message, codes=codes)
         self._promote_queued(s, result, now)
         return result
 
@@ -486,11 +528,10 @@ class DialogueManager:
         self._touch(new, now)
         s.pending = new
         if new.state == M.AWAITING_CLARIFICATION:
+            self._drop_proposal(new)                # the readback it belonged to is no longer valid
             return self._res(M.K_CLARIFICATION_PROMPT, P.clarification_question(new),
                              codes=["CORRECTED", "CLARIFYING"])
-        self._issue_confirmation(new)
-        self._remember_customer(s, new)
-        return self._res(M.K_CORRECTED, P.corrected_prompt(new), codes=["CORRECTED"])
+        return self._confirmation_result(s, new, now, kind=M.K_CORRECTED, codes=["CORRECTED"], corrected=True)
 
     # ---- CLARIFY_CUSTOMER
     def _on_clarify_customer(self, s, cmd, now) -> M.TurnResult:
@@ -561,15 +602,124 @@ class DialogueManager:
             return self._finalize_fields(s, p, now)
         p.revision += 1
         self._touch(p, now)
-        self._issue_confirmation(p)
-        self._remember_customer(s, p)
-        return self._res(M.K_CONFIRMATION_PROMPT, P.confirmation_prompt(p), codes=["NEEDS_CONFIRMATION"])
+        return self._confirmation_result(s, p, now, kind=M.K_CONFIRMATION_PROMPT, codes=["NEEDS_CONFIRMATION"])
 
     @staticmethod
     def _issue_confirmation(p: M.PendingAction) -> None:
         """The ONLY place a pending action becomes confirmable: records which revision we asked about."""
         p.state = M.AWAITING_CONFIRMATION
         p.prompted_revision = p.revision
+
+    # ================================================================== ledger backend (Phase 6)
+    def _confirmation_result(self, s, p, now, *, kind, codes, corrected: bool = False) -> M.TurnResult:
+        """Make `p` confirmable and return the readback to speak. In ledger mode that first means
+        obtaining a backend proposal for THIS exact revision; if the backend cannot, nothing is
+        confirmable and the user is told so."""
+        if self._ledger is not None:
+            failure = self._attach_proposal(s, p, now)
+            if failure is not None:
+                return failure
+        self._issue_confirmation(p)
+        self._remember_customer(s, p)
+        body = P.corrected_prompt(p) if corrected else P.confirmation_prompt(p)
+        return self._res(kind, body, codes=list(codes))
+
+    def _cancel_remote(self, proposal_id: str) -> pt.CancelOutcome:
+        try:
+            out = self._ledger.cancel(proposal_id)
+        except Exception:
+            return pt.CancelOutcome(pt.X_UNKNOWN, reason="port_error")
+        return out if isinstance(out, pt.CancelOutcome) else pt.CancelOutcome(pt.X_UNKNOWN, reason="bad_port_reply")
+
+    def _drop_proposal(self, p: M.PendingAction) -> None:
+        """The readback this proposal belonged to changed: it must never be confirmable again."""
+        if self._ledger is not None and p.proposal_id:
+            self._cancel_remote(p.proposal_id)
+        p.proposal_id = p.proposal_prompt = p.proposal_revision = None
+        p.confirm_unknown, p.confirm_attempts = False, 0
+
+    def _attach_proposal(self, s, p, now) -> Optional[M.TurnResult]:
+        self._drop_proposal(p)                       # a changed readback needs a NEW proposal
+        known = (self._turn[0] if self._turn else None) or p.known_customers
+        req = pt.ProposalRequest(
+            action_id=p.action_id, revision=p.revision, intent=p.intent, customer_name=p.customer_name,
+            customer_qualifier=p.customer_qualifier, customer_id=p.customer_id, amount_paise=p.amount_paise,
+            payment_method=p.payment_method,
+            transaction_date=getattr(p.date, "resolved", None), due_date=getattr(p.due_date, "resolved", None),
+            known_customers=tuple(known) if known else None)
+        try:
+            out = self._ledger.propose(req)
+        except Exception:
+            out = None
+        if not isinstance(out, pt.ProposalOutcome):
+            out = pt.ProposalOutcome(pt.P_UNAVAILABLE, reason="port_error")
+        if out.kind == pt.P_OK and isinstance(out.proposal_id, str) and out.proposal_id \
+                and isinstance(out.prompt, str) and out.prompt.strip():
+            p.proposal_id, p.proposal_prompt, p.proposal_revision = out.proposal_id, out.prompt, p.revision
+            return None
+        return self._propose_failed(s, p, out, now)
+
+    def _propose_failed(self, s, p, out: pt.ProposalOutcome, now) -> M.TurnResult:
+        if out.kind == pt.P_CUSTOMER_AMBIGUOUS and p.customer_id is None and out.candidates:
+            # several customers match: ask which one (the existing clarification flow), propose nothing yet
+            p.customer_options = [C.CustomerCandidate(c.get("customer_id"), c.get("name") or "",
+                                                      tuple(c.get("aliases") or ())) for c in out.candidates]
+            p.customer_id, p.customer_resolved, p.customer_reason = None, False, "AMBIGUOUS"
+            if M.NEED_CUSTOMER not in p.needs:
+                p.needs.insert(0, M.NEED_CUSTOMER)
+            p.state, p.attempts = M.AWAITING_CLARIFICATION, 0
+            p.revision += 1
+            self._touch(p, now)
+            return self._res(M.K_CLARIFICATION_PROMPT, P.clarification_question(p), codes=["BACKEND_AMBIGUOUS"])
+        message = {
+            pt.P_UNSUPPORTED: P.DATE_NOT_SUPPORTED if "date" in out.reason else P.PROMISE_NOT_SUPPORTED,
+            pt.P_CUSTOMER_NOT_FOUND: P.customer_not_found(p.customer_name),
+            pt.P_CUSTOMER_UNRESOLVABLE: P.CUSTOMER_UNRESOLVABLE,
+            pt.P_CUSTOMER_AMBIGUOUS: P.CUSTOMER_UNRESOLVABLE,
+            pt.P_MISMATCH: P.MISMATCH,
+            pt.P_REJECTED: P.BACKEND_REJECTED,
+        }.get(out.kind, P.BACKEND_DOWN)
+        self._settle(s, p, M.ABANDONED, now)          # nothing is confirmable, nothing was saved
+        result = self._res(M.K_BACKEND_ERROR, message, codes=["BACKEND_" + out.kind, out.reason or "-"])
+        self._promote_queued(s, result, now)
+        return result
+
+    def _confirm_remote(self, s, p, now) -> M.TurnResult:
+        """Explicit confirmation of the exact readback: only now is the backend asked to commit."""
+        if not p.proposal_id or p.proposal_revision != p.revision or p.intent is None or p.needs:
+            return self._res(M.K_REJECTED, P.BAD_INPUT + " " + self._reminder(p), codes=["NO_PROPOSAL_FOR_THIS_REVISION"])
+        try:
+            out = self._ledger.confirm(p.proposal_id)
+        except Exception:
+            out = None
+        if not isinstance(out, pt.ConfirmOutcome):
+            out = pt.ConfirmOutcome(pt.C_UNKNOWN, reason="port_error")
+        if out.kind == pt.C_COMMITTED and self._valid_amount(out.amount_paise):
+            want = "CREDIT" if p.intent == "ADD_CREDIT" else "PAYMENT"
+            same = out.amount_paise == p.amount_paise and out.transaction_type == want
+            name = out.customer_name or P.customer_label(p.customer_name, p.customer_qualifier)
+            text = P.committed_message(out.transaction_type or want, name, out.amount_paise, out.balance_paise,
+                                       out.replayed)
+            if not same:
+                text += " " + P.COMMIT_DIFFERS
+            self._settle(s, p, M.EXECUTED, now, summary=text)
+            result = self._res(
+                M.K_CONFIRMED, text,
+                codes=["COMMITTED"] + (["REPLAYED"] if out.replayed else []) + ([] if same else ["COMMIT_DIFFERS"]),
+                ledger_result={"transaction_id": out.transaction_id, "type": out.transaction_type,
+                               "amount_paise": out.amount_paise, "balance_paise": out.balance_paise,
+                               "replayed": out.replayed})
+            self._promote_queued(s, result, now)
+            return result
+        if out.kind == pt.C_REJECTED:
+            self._settle(s, p, M.REJECTED_BY_BACKEND, now)
+            result = self._res(M.K_BACKEND_ERROR, P.CONFIRM_REJECTED, codes=["BACKEND_REJECTED_CONFIRM"])
+            self._promote_queued(s, result, now)
+            return result
+        # no usable answer: NOT known to be saved. Stay pending; asking again is safe (backend is idempotent)
+        p.confirm_unknown = True
+        p.confirm_attempts += 1
+        return self._res(M.K_BACKEND_ERROR, P.CONFIRM_UNKNOWN, codes=["CONFIRM_OUTCOME_UNKNOWN", out.reason or "-"])
 
     # ---- UNKNOWN / unsupported (also: a bare amount answering "kitne rupaye?")
     def _on_unsupported(self, s, cmd, ir, now) -> M.TurnResult:
@@ -613,7 +763,15 @@ class DialogueManager:
             if ref is not None:
                 nm = ref.spoken_name or (ref.candidates[0].name if len(ref.candidates) == 1 else None)
                 who = P.customer_label(nm, ref.qualifier) if (nm or ref.qualifier) else None
-            return self._res(M.K_QUERY, P.query_ack(cmd.intent, who) + reminder, query=cmd, codes=["QUERY"])
+            text = None
+            if self._query_resolver is not None:          # the real answer comes from the backend's data
+                try:
+                    text = self._query_resolver(cmd)
+                except Exception:
+                    text = None
+            if not (isinstance(text, str) and text.strip()):
+                text = P.query_ack(cmd.intent, who)
+            return self._res(M.K_QUERY, text + reminder, query=cmd, codes=["QUERY"])
         if "AMBIGUOUS_CUSTOMER" in cmd.ambiguities or "CUSTOMER_FUZZY_MATCH" in cmd.ambiguities:
             cust = getattr(cmd.payload, "customer", None)
             opts = P.join_options(P.option_label(c) for c in (cust.candidates if cust else ())) + "?"
@@ -693,9 +851,7 @@ class DialogueManager:
         if p.needs:
             p.state = M.AWAITING_CLARIFICATION
             return self._res(M.K_CLARIFICATION_PROMPT, P.clarification_question(p), codes=["CLARIFYING"])
-        self._issue_confirmation(p)
-        self._remember_customer(s, p)
-        return self._res(M.K_CONFIRMATION_PROMPT, P.confirmation_prompt(p), codes=["NEEDS_CONFIRMATION"])
+        return self._confirmation_result(s, p, now, kind=M.K_CONFIRMATION_PROMPT, codes=["NEEDS_CONFIRMATION"])
 
     def _customer_slot(self, s, ref, allow_context: bool = False):
         """-> (name, qualifier, id, options, resolved, need_clarification). Never guesses.
@@ -852,10 +1008,8 @@ class DialogueManager:
         if not first:
             p.revision += 1
         self._touch(p, now)
-        self._issue_confirmation(p)
-        self._remember_customer(s, p)
-        return self._res(M.K_CONFIRMATION_PROMPT, P.confirmation_prompt(p),
-                         codes=["NEEDS_CONFIRMATION"] + list(codes or ["DIRECTION_RESOLVED"]))
+        return self._confirmation_result(s, p, now, kind=M.K_CONFIRMATION_PROMPT,
+                                         codes=["NEEDS_CONFIRMATION"] + list(codes or ["DIRECTION_RESOLVED"]))
 
     @staticmethod
     def _restates(p: M.PendingAction, cmd) -> bool:

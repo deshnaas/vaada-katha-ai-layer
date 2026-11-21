@@ -66,6 +66,11 @@ def confirmation_prompt(p, disclose_ai: bool = True) -> str:
     lead = f"Amount {amt} suna. " if ({"AMOUNT_SHORTHAND", "AMOUNT_UNUSUALLY_LARGE"} & set(p.notes)) else ""
     if disclose_ai and "AI_ASSISTED" in p.notes:    # the sentence was read with AI help: say so
         lead = "Maine aisa samjha: " + lead
+    remote = getattr(p, "proposal_prompt", None)
+    if remote:
+        # Ledger-backend mode: the sentence the user confirms is the BACKEND's own prompt for the
+        # proposal it created (customer, amount and direction as the backend will record them).
+        return lead + remote
     method = {"UPI": " (UPI)", "CASH": " (cash)"}.get(p.payment_method or "", "")
     if p.intent == "ADD_CREDIT":
         when = _when(p.date)
@@ -147,6 +152,50 @@ REPEAT_BY_CODE = {
     "commitment_date": "Kis din? Poora bolein, jaise 'Ramesh Friday ko 500 dega'.",
     "date": "Kaunsa din? Dobara bolein.",
 }
+
+
+# ------------------------------------------------------------------ ledger-backend messages
+BACKEND_DOWN = "Server se connect nahi ho paya, isliye entry nahi ki. Thodi der baad dobara bolein."
+BACKEND_REJECTED = "Backend ne ye entry manzoor nahi ki, isliye save nahi hui."
+PROMISE_NOT_SUPPORTED = "Promise abhi backend mein save nahi ho sakta, isliye nahi likha."
+DATE_NOT_SUPPORTED = "Purani tareekh ki entry abhi backend support nahi karta, isliye nahi likhi. Aaj ki entry bolein."
+CUSTOMER_UNRESOLVABLE = ("Is naam ke kai customers hain aur pehchaan nahi ban paayi, isliye entry nahi ki. "
+                         "Alias ke saath bolein.")
+MISMATCH = "Backend ne alag customer ya amount samjha, isliye entry nahi ki. Poora naam bolein."
+CONFIRM_UNKNOWN = ("Server se jawab nahi mila, pakka nahi hai ki entry hui ya nahi. "
+                   "Dobara 'haan' bolein; duplicate entry nahi banegi.")
+CONFIRM_REJECTED = "Ye entry confirm nahi ho saki, save nahi hui."
+COMMIT_DIFFERS = "Dhyan dein: backend ne alag amount ya type save kiya hai. Balance check karein."
+CANCEL_TOO_LATE = "Ye entry pehle hi save ho chuki hai, cancel nahi ho sakti."
+CANCEL_UNACKED = " (Server ko cancel nahi bata paya, par main ise confirm nahi karunga.)"
+EXPIRED_BUT_SAVED = "Pichli entry save ho chuki thi."
+EXPIRED_UNCERTAIN = "Pichli entry ka natija pakka nahi hai. Balance check karein."
+
+
+def customer_not_found(name: Optional[str]) -> str:
+    who = f"'{name}' naam ka" if name else "Is naam ka"
+    return f"{who} customer nahi mila. Maine naya customer nahi banaya; pehle customer banana hoga."
+
+
+def committed_message(txn_type: str, customer: str, amount_paise: int, backend_total_paise: Optional[int],
+                      replayed: bool = False) -> str:
+    """Spoken after the BACKEND confirmed the transaction. Every number is exactly the backend's own
+    (the figure after the commit is passed through for wording only; nothing is calculated here)."""
+    amt = format_rupees(amount_paise)
+    if txn_type == "CREDIT":
+        text = f"Done! {customer} ke {amt} record ho gaye."
+    else:
+        text = f"Done! {customer} ka {amt} payment record ho gaya."
+    if replayed:
+        text = "Ye pehle hi save ho chuka tha. " + text
+    if isinstance(backend_total_paise, int):
+        if backend_total_paise > 0:
+            text += f" Ab {format_rupees(backend_total_paise)} baaki hai."
+        elif backend_total_paise == 0:
+            text += " Ab koi hisaab baaki nahi."
+        else:
+            text += f" Ab {format_rupees(-backend_total_paise)} zyada diye hain."
+    return text
 
 
 def query_ack(intent: str, who: Optional[str] = None) -> str:
