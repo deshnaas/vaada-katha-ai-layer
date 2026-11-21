@@ -1,0 +1,6 @@
+# OPTIONAL heavy dependencies for the real speaker-verification model (SpeechBrain ECAPA-TDNN).
+# Install CPU torch first:  pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+# then:                     pip install -r requirements-biometrics.txt
+# The gateway itself does not need these unless VAADA_VOICE_AUTH_MODE=enforce is used with the real model.
+speechbrain==1.1.2
+huggingface_hub

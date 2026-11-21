@@ -12,6 +12,9 @@ Code: `backend/voice_gateway/` (`app.py` = endpoint, `gnani_stt.py` = the only f
 | `language` | no | default `hi-IN,en-IN`; or one code, up to 4 comma-separated codes, or `indic-auto`. Codes: bn-IN en-IN gu-IN hi-IN kn-IN ml-IN mr-IN pa-IN ta-IN te-IN |
 | `client_msg_id` | no | unique per recording; re-sending the same id replays the earlier answer and does nothing twice |
 
+Optional headers: `X-Voice-Auth-Token` (only with `VAADA_VOICE_AUTH_MODE=enforce`, see [voice_auth.md](voice_auth.md)) and
+`X-Voice-Want-Audio: false` (skip text-to-speech for this turn; only matters when `VAADA_TTS_ENABLED=true`).
+
 ## Response 200
 
 ```json
@@ -20,8 +23,12 @@ Code: `backend/voice_gateway/` (`app.py` = endpoint, `gnani_stt.py` = the only f
  "reply":{"text":"Suresh ke ₹300.00 add kar doon?","speak":["Suresh ke ₹300.00 add kar doon?"],"kind":"CONFIRMATION_PROMPT"},
  "dialogue":{"state":"AWAITING_CONFIRMATION","awaiting":"confirmation",
              "pending":{"action_id":"a_…","intent":"ADD_CREDIT","customer_name":"Suresh","amount_paise":30000,"transaction_type":"CREDIT","needs":[]}},
- "ledger":null,"notice":null,"duplicate":false}
+ "ledger":null,"notice":null,"duplicate":false,
+ "audio":{"status":"generated","reason":null,"mime_type":"audio/wav","encoding":"base64","data":"UklGR…","sample_rate":24000,"channels":1,"duration_ms":3440}}
 ```
+`audio` is the spoken version of `reply.speak` (Gnani Timbre TTS), an **optional layer**: `status` is `generated`, `unavailable`
+(TTS failed; use the text) or `skipped` (not run: `tts_disabled` by default, `nothing_to_speak`, `not_requested`, `text_too_long`).
+The text reply is always present. Full contract, Android playback and the duplicate policy: [voice_tts.md](voice_tts.md).
 After the user says "haan", `ledger` is `{"committed":true,"transaction_id":1,"type":"CREDIT","amount_paise":30000,"balance_paise":30000,"replayed":false}`.
 
 * **Show/speak `reply.speak` in order** (empty for a duplicate replay).

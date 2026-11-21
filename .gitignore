@@ -13,3 +13,8 @@ backend/out/
 *.sqlite
 *.sqlite3
 .pytest_cache/
+
+# biometric data and model cache: never commit
+.voiceprints/
+*.vp
+.speaker_model/

@@ -8,6 +8,7 @@ never confirms anything itself, and never logs transcripts, names, amounts or pr
 
 Run (from backend/):  uvicorn voice_gateway.app:app --host 0.0.0.0 --port 8100     Swagger UI: /docs
 """
+import base64
 import io
 import logging
 import os
@@ -20,7 +21,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, UploadFile
+from collections import OrderedDict
+
+from fastapi import Depends, FastAPI, File, Form, Header, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -29,7 +32,10 @@ from dialogue import DialogueManager
 from dialogue import models as M
 from ledger_api import LedgerAPIClient, LedgerAPIConfig
 from ledger_api.adapter import LedgerAdapter
+from voice_auth.api import get_voice_auth, router as voice_auth_router
+from voice_auth.service import VoiceAuthService
 from voice_gateway import gnani_stt as G
+from voice_gateway import gnani_tts as T
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")      # GNANI_API_KEY etc.; the file is never printed
 log = logging.getLogger("vaada.gateway")
@@ -49,8 +55,9 @@ SPOKEN = {                                                        # short Hindi-
     "STT_NOT_CONFIGURED": "Awaaz service set nahi hai.",
     "STT_BAD_RESPONSE": "Awaaz samajh nahi aayi, dobara bolein.",
     "INTERNAL": "Kuch gadbad ho gayi. Dobara try karein.",
+    "AUTH_REQUIRED": "Pehle awaaz se verify karein.",       # only when VAADA_VOICE_AUTH_MODE=enforce
 }
-HTTP_STATUS = {"BAD_REQUEST": 422, "BAD_AUDIO": 400, "AUDIO_TOO_LARGE": 413, "STT_TIMEOUT": 504,
+HTTP_STATUS = {"AUTH_REQUIRED": 401, "BAD_REQUEST": 422, "BAD_AUDIO": 400, "AUDIO_TOO_LARGE": 413, "STT_TIMEOUT": 504,
                "STT_UNAVAILABLE": 503, "STT_RATE_LIMITED": 429, "STT_AUTH": 502, "STT_NOT_CONFIGURED": 503,
                "STT_BAD_RESPONSE": 502, "INTERNAL": 500}
 
@@ -67,6 +74,20 @@ class Reply(BaseModel):
                                          "duplicate replay (nothing must be spoken twice).")
     kind: str = Field(description="Dialogue kind, e.g. CONFIRMATION_PROMPT, CONFIRMED, CLARIFICATION_PROMPT, "
                                   "CANCELLED, QUERY_PASSTHROUGH, BACKEND_ERROR, REMINDER, DUPLICATE_REPLAY.")
+
+
+class AudioOut(BaseModel):
+    status: str = Field(description="'generated' (audio is in `data`), 'unavailable' (TTS was attempted and failed: use the "
+                                    "text) or 'skipped' (TTS was intentionally not run). The text reply is ALWAYS present.")
+    reason: Optional[str] = Field(None, description="Why it was skipped/unavailable, e.g. nothing_to_speak, tts_disabled, "
+                                                    "not_requested, text_too_long, tts_timeout, tts_auth, tts_rate_limited, "
+                                                    "tts_unavailable, tts_invalid_audio, tts_not_configured, tts_busy.")
+    mime_type: Optional[str] = Field(None, description="'audio/wav' (a complete WAV file with header, PCM 16-bit).")
+    encoding: Optional[str] = Field(None, description="'base64' (standard alphabet, no line breaks).")
+    data: Optional[str] = Field(None, description="The WAV file, base64-encoded. Present only when status is 'generated'.")
+    sample_rate: Optional[int] = Field(None, description="Read from the WAV header actually received (Hz).")
+    channels: Optional[int] = None
+    duration_ms: Optional[int] = None
 
 
 class PendingInfo(BaseModel):
@@ -103,6 +124,8 @@ class VoiceTurnResponse(BaseModel):
     ledger: Optional[LedgerOutcome] = None
     notice: Optional[str] = None
     duplicate: bool = False
+    audio: AudioOut = Field(default_factory=lambda: AudioOut(status="skipped", reason="tts_disabled"),
+                            description="Spoken version of reply.speak (Gnani Timbre). Optional audio layer: see AudioOut.")
 
 
 class ErrorBody(BaseModel):
@@ -128,6 +151,7 @@ class Services:
     stt: G.GnaniSTT
     manager: DialogueManager
     adapter: LedgerAdapter
+    tts: Optional[T.GnaniTTS] = None          # optional audio layer; None = no TTS
 
 
 _services: Optional[Services] = None
@@ -136,7 +160,7 @@ _services: Optional[Services] = None
 def build_services() -> Services:
     adapter = LedgerAdapter(LedgerAPIClient(LedgerAPIConfig.from_env()))
     manager = DialogueManager(120, ledger=adapter, query_resolver=adapter.answer_query)
-    return Services(stt=G.GnaniSTT(), manager=manager, adapter=adapter)
+    return Services(stt=G.GnaniSTT(), manager=manager, adapter=adapter, tts=T.GnaniTTS())
 
 
 def get_services() -> Services:
@@ -155,6 +179,10 @@ app = FastAPI(
         "backend) and returns what to show and say. The backend is authoritative for every saved entry. "
         "No authentication: for trusted-LAN demo use only."),
 )
+
+
+app.include_router(voice_auth_router)                  # additive: /v1/auth/* and /v1/admin/voiceprints/*
+_session_account: "OrderedDict[str, str]" = OrderedDict()      # gateway session -> account it was last authenticated as
 
 
 @app.exception_handler(GatewayError)
@@ -201,6 +229,33 @@ def _usable(text: str) -> bool:
     return len(re.sub(r"[\W_]+", "", text, flags=re.UNICODE)) >= 2
 
 
+def _speak(services: "Services", speak: List[str], want_audio: bool) -> AudioOut:
+    """Turn the FINAL reply text into audio. Runs strictly AFTER the dialogue/ledger work is finished, never raises, and has no
+    way to influence a ledger action: it only reads text. Nothing about the text or audio is logged.
+
+    Duplicate replays arrive with an empty `speak` and are therefore skipped (nothing is ever spoken twice, and no audio is
+    cached or regenerated)."""
+    if not want_audio:
+        return AudioOut(status="skipped", reason="not_requested")
+    text = " ".join(s.strip() for s in speak if s and s.strip())
+    if not text:
+        return AudioOut(status="skipped", reason="nothing_to_speak")
+    tts = services.tts
+    if tts is None or not tts.enabled:
+        return AudioOut(status="skipped", reason="tts_disabled")
+    try:
+        r = tts.synthesize(text)
+    except T.TTSError as exc:
+        log.warning("voice turn: tts unavailable (%s)", exc.code)
+        return AudioOut(status="skipped" if isinstance(exc, T.TTSTextTooLong) else "unavailable", reason=exc.code)
+    except Exception as exc:
+        log.error("voice turn: tts failed unexpectedly (%s)", type(exc).__name__)
+        return AudioOut(status="unavailable", reason="tts_error")
+    return AudioOut(status="generated", mime_type=r.mime_type, encoding="base64",
+                    data=base64.b64encode(r.audio).decode("ascii"), sample_rate=r.sample_rate, channels=r.channels,
+                    duration_ms=r.duration_ms)
+
+
 def _dialogue_view(r: M.TurnResult) -> Dialogue:
     p = r.pending
     pending = PendingInfo(action_id=p.action_id, intent=p.intent, customer_name=p.customer_name,
@@ -231,11 +286,30 @@ def voice_turn(
     client_msg_id: Optional[str] = Form(None, description="Optional unique id per recording. If the app retries the "
                                                           "SAME upload with the same id, the dialogue replays its "
                                                           "earlier answer and nothing is done twice."),
+    x_voice_want_audio: Optional[str] = Header(None, description="Optional. 'false' skips text-to-speech for this turn (saves "
+                                                                 "credits and latency). Only matters when the gateway runs "
+                                                                 "with VAADA_TTS_ENABLED=true."),
+    x_voice_auth_token: Optional[str] = Header(None, description="Voice-authentication token from POST /v1/auth/verify. "
+                                                                  "Only checked when the gateway runs with "
+                                                                  "VAADA_VOICE_AUTH_MODE=enforce; ignored otherwise."),
     services: Services = Depends(get_services),
+    auth: VoiceAuthService = Depends(get_voice_auth),
 ):
     t0 = time.monotonic()
+    want_audio = (x_voice_want_audio or "true").strip().lower() not in ("0", "false", "no", "off")
     if not SESSION_RE.match(session_id or ""):
         raise GatewayError("BAD_REQUEST", "session_id must be 1-64 chars of A-Z a-z 0-9 _ -")
+    if auth.enforcing:                       # authentication gate: before STT, dialogue or any ledger call
+        account = auth.authorize(x_voice_auth_token, session_id)        # server-side lookup; the client cannot assert it
+        if account is None:
+            raise GatewayError("AUTH_REQUIRED", "voice authentication required for this session")
+        previous = _session_account.get(session_id)
+        if previous is not None and previous != account:
+            services.manager.end_session(session_id)    # one account's pending confirmation is never confirmable by another
+        _session_account[session_id] = account
+        _session_account.move_to_end(session_id)
+        while len(_session_account) > 10_000:
+            _session_account.popitem(last=False)
     if client_msg_id is not None and not MSG_ID_RE.match(client_msg_id):
         raise GatewayError("BAD_REQUEST", "client_msg_id has invalid characters")
     lang = G.normalise_language(language)
@@ -259,7 +333,8 @@ def voice_turn(
         spoken = UNCLEAR_REPLY
         return VoiceTurnResponse(status="unclear", session_id=session_id,
                                  transcript=Transcript(text=stt.text, language_code=stt.language_code),
-                                 reply=Reply(text=spoken, speak=[spoken], kind="UNCLEAR"))
+                                 reply=Reply(text=spoken, speak=[spoken], kind="UNCLEAR"),
+                                 audio=_speak(services, [spoken], want_audio))
 
     try:
         result = services.manager.process_text(
@@ -275,11 +350,13 @@ def voice_turn(
                            replayed=bool(lr.get("replayed"))) if lr else None
     log.info("voice turn: ok kind=%s state=%s committed=%s %d ms", result.kind, result.state, ledger is not None,
              (time.monotonic() - t0) * 1000)
+    speak = result.utterances()
     return VoiceTurnResponse(
         status="ok", session_id=session_id,
         transcript=Transcript(text=stt.text, language_code=stt.language_code),
-        reply=Reply(text=result.message, speak=result.utterances(), kind=result.kind),
-        dialogue=_dialogue_view(result), ledger=ledger, notice=result.notice, duplicate=result.duplicate)
+        reply=Reply(text=result.message, speak=speak, kind=result.kind),
+        dialogue=_dialogue_view(result), ledger=ledger, notice=result.notice, duplicate=result.duplicate,
+        audio=_speak(services, speak, want_audio))          # the ledger work is already finished; TTS cannot change it
 
 
 @app.get("/health", tags=["System"], summary="Gateway status (no secrets)")

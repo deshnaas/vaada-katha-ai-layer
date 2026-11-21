@@ -5,3 +5,5 @@ python-dotenv
 pytest
 python-multipart
 httpx
+numpy
+cryptography
