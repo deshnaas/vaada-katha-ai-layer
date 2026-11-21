@@ -57,6 +57,15 @@ import androidx.core.content.ContextCompat
 import com.vaada.models.AssistantState
 import com.vaada.models.AudioCaptureMetadata
 import com.vaada.service.VaadaAudioService
+import com.vaada.ui.assistant.HomeScreen
+import com.vaada.ui.components.VaadaBottomBar
+import com.vaada.ui.ledger.KhataScreen
+import com.vaada.ui.navigation.VaadaDestination
+import com.vaada.ui.theme.KiranaCreamBg
+import com.vaada.ui.theme.KiranaGreenPrimary
+import com.vaada.ui.theme.KiranaTextPrimary
+import com.vaada.ui.theme.KiranaTextSecondary
+import com.vaada.ui.theme.VaadaTheme
 
 class MainActivity : ComponentActivity() {
 
@@ -64,13 +73,93 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MaterialTheme {
+            VaadaTheme {
+                val context = LocalContext.current
+                val assistantState by VaadaAudioService.assistantState.collectAsState()
+                val lastMetadata by VaadaAudioService.lastCapturedMetadata.collectAsState()
+                val detectionCount by VaadaAudioService.wakeWordDetectionCount.collectAsState()
+                val lastScore by VaadaAudioService.lastWakeWordScore.collectAsState()
+                val threshold by VaadaAudioService.wakeWordThreshold.collectAsState()
+                val lastEvaluatedScore by VaadaAudioService.lastEvaluatedScore.collectAsState()
+
+                // Permissions check
+                val requiredPermissions = remember {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+                    } else {
+                        arrayOf(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
+
+                var hasPermissions by remember {
+                    mutableStateOf(
+                        requiredPermissions.all {
+                            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+                        }
+                    )
+                }
+
+                val permissionLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestMultiplePermissions()
+                ) { results ->
+                    hasPermissions = results.values.all { it }
+                }
+
+                LaunchedEffect(Unit) {
+                    if (!hasPermissions) {
+                        permissionLauncher.launch(requiredPermissions)
+                    }
+                }
+
+                var currentDestination by remember { mutableStateOf(VaadaDestination.Assistant) }
+
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    Scaffold { innerPadding ->
-                        VaadaAssistantScreen(modifier = Modifier.padding(innerPadding))
+                    Scaffold(
+                        bottomBar = {
+                            VaadaBottomBar(
+                                currentDestination = currentDestination,
+                                onNavigate = { currentDestination = it }
+                            )
+                        }
+                    ) { innerPadding ->
+                        when (currentDestination) {
+                            VaadaDestination.Assistant -> {
+                                HomeScreen(
+                                    state = assistantState,
+                                    hasPermissions = hasPermissions,
+                                    lastMetadata = lastMetadata,
+                                    onStartService = { VaadaAudioService.startService(context) },
+                                    onStopService = { VaadaAudioService.stopService(context) },
+                                    onStartRecording = { VaadaAudioService.startRecording(context) },
+                                    onStopRecording = { VaadaAudioService.stopRecording(context) },
+                                    onRequestPermissions = { permissionLauncher.launch(requiredPermissions) },
+                                    modifier = Modifier.padding(innerPadding)
+                                )
+                            }
+                            VaadaDestination.Ledger -> {
+                                KhataScreen(
+                                    modifier = Modifier.padding(innerPadding)
+                                )
+                            }
+                            VaadaDestination.Settings -> {
+                                SettingsDiagnosticsScreen(
+                                    state = assistantState,
+                                    hasPermissions = hasPermissions,
+                                    detectionCount = detectionCount,
+                                    lastTriggerScore = lastScore,
+                                    threshold = threshold,
+                                    lastEvaluatedScore = lastEvaluatedScore,
+                                    metadata = lastMetadata,
+                                    onStartService = { VaadaAudioService.startService(context) },
+                                    onStopService = { VaadaAudioService.stopService(context) },
+                                    onStopRecording = { VaadaAudioService.stopRecording(context) },
+                                    modifier = Modifier.padding(innerPadding)
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -79,46 +168,20 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun VaadaAssistantScreen(modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val assistantState by VaadaAudioService.assistantState.collectAsState()
-    val lastMetadata by VaadaAudioService.lastCapturedMetadata.collectAsState()
-    val detectionCount by VaadaAudioService.wakeWordDetectionCount.collectAsState()
-    val lastScore by VaadaAudioService.lastWakeWordScore.collectAsState()
-    val threshold by VaadaAudioService.wakeWordThreshold.collectAsState()
-    val lastEvaluatedScore by VaadaAudioService.lastEvaluatedScore.collectAsState()
-
-    // Permissions check
-    val requiredPermissions = remember {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            arrayOf(Manifest.permission.RECORD_AUDIO)
-        }
-    }
-
-    var hasPermissions by remember {
-        mutableStateOf(
-            requiredPermissions.all {
-                ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
-            }
-        )
-    }
-
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { results ->
-        hasPermissions = results.values.all { it }
-    }
-
-    LaunchedEffect(Unit) {
-        if (!hasPermissions) {
-            permissionLauncher.launch(requiredPermissions)
-        }
-    }
-
+private fun SettingsDiagnosticsScreen(
+    state: AssistantState,
+    hasPermissions: Boolean,
+    detectionCount: Int,
+    lastTriggerScore: Float,
+    threshold: Float,
+    lastEvaluatedScore: Float,
+    metadata: AudioCaptureMetadata?,
+    onStartService: () -> Unit,
+    onStopService: () -> Unit,
+    onStopRecording: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     val scrollState = rememberScrollState()
-
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -126,116 +189,73 @@ fun VaadaAssistantScreen(modifier: Modifier = Modifier) {
             .padding(20.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // App Header
-        AppHeader()
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Permission Banner
-        if (!hasPermissions) {
-            PermissionCard {
-                permissionLauncher.launch(requiredPermissions)
-            }
-            Spacer(modifier = Modifier.height(16.dp))
-        }
-
-        // Assistant Status & Wake-Word Monitor Card
-        AssistantStatusCard(
-            state = assistantState,
-            hasPermissions = hasPermissions,
-            detectionCount = detectionCount,
-            lastTriggerScore = lastScore,
-            threshold = threshold,
-            lastEvaluatedScore = lastEvaluatedScore,
-            onStartService = { VaadaAudioService.startService(context) },
-            onStopService = { VaadaAudioService.stopService(context) },
-            onStopRecording = { VaadaAudioService.stopRecording(context) }
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Push-to-Talk Fallback Control
-        PushToTalkCard(
-            state = assistantState,
-            isEnabled = hasPermissions && assistantState !is AssistantState.Stopped,
-            onStartRecording = { VaadaAudioService.startRecording(context) },
-            onStopRecording = { VaadaAudioService.stopRecording(context) }
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Audio Capture Inspector (Shows captured utterance stats)
-        AudioInspectorCard(metadata = lastMetadata)
-    }
-}
-
-@Composable
-private fun AppHeader() {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.Start
-    ) {
         Row(
+            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                modifier = Modifier
-                    .size(10.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFF2E7D32))
-            )
-            Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = "VAADA KHATA",
-                fontSize = 12.sp,
+                text = "Engine Diagnostics & Settings",
+                style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
-                letterSpacing = 1.2.sp,
-                color = MaterialTheme.colorScheme.primary
+                color = KiranaGreenPrimary
             )
         }
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = "Voice Assistant & Ledger",
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold
+            text = "Technical telemetry, threshold calibration and hardware handoff profiling moved here to keep the Home screen clean.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = KiranaTextSecondary
         )
-        Text(
-            text = "Target: CMF Phone 2 Pro | Branch: feature/android-wakeword",
-            fontSize = 11.sp,
-            color = MaterialTheme.colorScheme.outline
+        Spacer(modifier = Modifier.height(16.dp))
+
+        AssistantStatusCard(
+            state = state,
+            hasPermissions = hasPermissions,
+            detectionCount = detectionCount,
+            lastTriggerScore = lastTriggerScore,
+            threshold = threshold,
+            lastEvaluatedScore = lastEvaluatedScore,
+            onStartService = onStartService,
+            onStopService = onStopService,
+            onStopRecording = onStopRecording
         )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        AudioInspectorCard(metadata = metadata)
     }
 }
 
 @Composable
-private fun PermissionCard(onRequestPermissions: () -> Unit) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+private fun StagePlaceholderScreen(
+    title: String,
+    subtitle: String,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
-                text = "Permissions Required",
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onErrorContainer
+                text = title,
+                style = MaterialTheme.typography.headlineSmall,
+                color = KiranaGreenPrimary,
+                fontWeight = FontWeight.Bold
             )
-            Spacer(modifier = Modifier.height(4.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "Microphone and Notification permissions are needed to run the foreground audio service.",
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.onErrorContainer
+                text = subtitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = KiranaTextSecondary
             )
-            Spacer(modifier = Modifier.height(12.dp))
-            Button(
-                onClick = onRequestPermissions,
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-            ) {
-                Text("Grant Permissions", color = MaterialTheme.colorScheme.onError)
-            }
         }
     }
 }
+
+
 
 @Composable
 private fun AssistantStatusCard(
@@ -401,77 +421,7 @@ private fun AssistantStatusCard(
     }
 }
 
-@Composable
-private fun PushToTalkCard(
-    state: AssistantState,
-    isEnabled: Boolean,
-    onStartRecording: () -> Unit,
-    onStopRecording: () -> Unit
-) {
-    val isRecording = state is AssistantState.Listening
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "MANUAL PUSH-TO-TALK FALLBACK",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.outline
-                )
-                Text(
-                    text = if (isEnabled) "Ready" else "Service Inactive",
-                    fontSize = 11.sp,
-                    color = if (isEnabled) MaterialTheme.colorScheme.primary else Color.Gray
-                )
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Button(
-                onClick = {
-                    if (isRecording) {
-                        onStopRecording()
-                    } else {
-                        onStartRecording()
-                    }
-                },
-                enabled = isEnabled,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isRecording) Color(0xFFC62828) else MaterialTheme.colorScheme.primary
-                )
-            ) {
-                Text(
-                    text = if (isRecording) "⏹  Stop Recording Command" else "🎙  Push to Talk (Manual Trigger)",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = "Alternative to saying \"Hey Jarvis\". Tap to record manual utterance.",
-                fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.outline
-            )
-        }
-    }
-}
 
 @Composable
 private fun AudioInspectorCard(metadata: AudioCaptureMetadata?) {
