@@ -34,6 +34,7 @@ class FakeBackend:
         self.proposals: Dict[str, dict] = {}
         self.calls: List[tuple] = []                  # (route, method, path) of every request that REACHED the backend
         self.bodies: List[dict] = []                  # parsed JSON bodies received
+        self.seen_headers: List[Optional[dict]] = []  # request headers beyond the defaults, one entry per request
         self._inject: Dict[str, list] = {}
         self._next_prop = 1
         if seed:
@@ -60,7 +61,8 @@ class FakeBackend:
         return [t for t in self.transactions if customer_id in (None, t["customer_id"])]
 
     # ------------------------------------------------------------------ transport entry point
-    def __call__(self, method: str, url: str, body, timeout: float, max_bytes: int):
+    def __call__(self, method: str, url: str, body, timeout: float, max_bytes: int, headers=None):
+        self.seen_headers.append(dict(headers) if headers else None)     # what the client sent (e.g. Authorization)
         u = urllib.parse.urlparse(url)
         path, query = u.path, dict(urllib.parse.parse_qsl(u.query))
         route = self._route(method, path)

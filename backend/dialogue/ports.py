@@ -16,10 +16,12 @@ P_UNSUPPORTED = "UNSUPPORTED"                        # the backend cannot store 
 P_REJECTED = "REJECTED"                              # the backend refused it (validation / business rule)
 P_UNAVAILABLE = "UNAVAILABLE"                        # no usable answer; nothing was proposed
 P_MISMATCH = "MISMATCH"                              # the backend understood something different
+P_UNAUTHORIZED = "UNAUTHORIZED"                      # merchant identity missing / invalid / expired / not allowed: nothing was proposed
 
 # ---- confirm outcomes
 C_COMMITTED = "COMMITTED"
 C_REJECTED = "REJECTED"                              # definitively NOT committed (cancelled / unknown proposal)
+C_UNAUTHORIZED = "UNAUTHORIZED"                      # merchant identity refused: definitively NOT committed
 C_UNKNOWN = "UNKNOWN"                                # no answer: it may or may not have been committed
 
 # ---- cancel outcomes

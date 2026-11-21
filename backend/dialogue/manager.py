@@ -678,6 +678,7 @@ class DialogueManager:
             pt.P_CUSTOMER_AMBIGUOUS: P.CUSTOMER_UNRESOLVABLE,
             pt.P_MISMATCH: P.MISMATCH,
             pt.P_REJECTED: P.BACKEND_REJECTED,
+            pt.P_UNAUTHORIZED: P.AUTH_FAILED,
         }.get(out.kind, P.BACKEND_DOWN)
         self._settle(s, p, M.ABANDONED, now)          # nothing is confirmable, nothing was saved
         result = self._res(M.K_BACKEND_ERROR, message, codes=["BACKEND_" + out.kind, out.reason or "-"])
@@ -709,6 +710,11 @@ class DialogueManager:
                 ledger_result={"transaction_id": out.transaction_id, "type": out.transaction_type,
                                "amount_paise": out.amount_paise, "balance_paise": out.balance_paise,
                                "replayed": out.replayed})
+            self._promote_queued(s, result, now)
+            return result
+        if out.kind == pt.C_UNAUTHORIZED:          # the backend refused the merchant before doing anything: NOT saved
+            self._settle(s, p, M.REJECTED_BY_BACKEND, now)
+            result = self._res(M.K_BACKEND_ERROR, P.AUTH_FAILED_CONFIRM, codes=["BACKEND_UNAUTHORIZED_CONFIRM"])
             self._promote_queued(s, result, now)
             return result
         if out.kind == pt.C_REJECTED:

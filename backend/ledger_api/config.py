@@ -1,14 +1,26 @@
-"""Settings for the ledger-backend API client. No credentials live here (the backend has no auth).
+"""Settings for the ledger-backend API client. No credential is ever hard-coded here.
 
 Environment variables (all optional):
   VAADA_LEDGER_API_URL      base URL of the ledger backend   (default http://127.0.0.1:8000)
   VAADA_LEDGER_API_TIMEOUT  seconds to wait per request      (default 5)
   VAADA_LEDGER_API_RETRIES  extra attempts for SAFE calls    (default 2; propose is never retried)
+  VAADA_LEDGER_API_TOKEN    the MERCHANT's backend session token, sent as `Authorization: Bearer <token>`.
+                            Only for the single-merchant "static" mode (see ledger_api/merchant.py); in the normal
+                            multi-merchant "passthrough" mode each request carries its own token and this stays unset.
+                            It is never logged and never shown by repr().
 """
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Mapping, Optional
 from urllib.parse import urlparse
+
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=\-]{8,2048}$")        # RFC 6750 b64token: no spaces, no control characters
+
+
+def valid_token(token: object) -> bool:
+    """A bearer token must be a plain token string: this also makes header injection (CR/LF, spaces) impossible."""
+    return isinstance(token, str) and bool(_TOKEN_RE.match(token))
 
 
 @dataclass(frozen=True)
@@ -19,8 +31,11 @@ class LedgerAPIConfig:
     retry_backoff_s: float = 0.2
     max_response_bytes: int = 1_000_000
     customer_cache_s: float = 30.0       # how long the customer list used for name matching is reused
+    api_token: Optional[str] = field(default=None, repr=False)     # merchant session token; see the module docstring
 
     def __post_init__(self):
+        if self.api_token is not None and not valid_token(self.api_token):
+            raise ValueError("api_token is not a valid bearer token")        # never echo the value
         u = urlparse(self.base_url)
         if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password:
             raise ValueError("base_url must be http(s)://host[:port] with no embedded credentials")
@@ -46,4 +61,7 @@ class LedgerAPIConfig:
                     kw[field] = cast(raw)
                 except ValueError:
                     pass                  # a bad value keeps the default rather than crashing startup
+        token = (env.get("VAADA_LEDGER_API_TOKEN") or "").strip()
+        if token:
+            kw["api_token"] = token       # an invalid token raises: authenticated mode must never silently degrade
         return cls(**kw)

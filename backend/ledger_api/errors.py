@@ -44,6 +44,14 @@ class LedgerValidation(LedgerHTTPError):        # 422: the request shape/value w
     pass
 
 
+class LedgerUnauthorized(LedgerHTTPError):      # 401: merchant credentials missing, invalid or expired
+    """Never retried. Raised BEFORE the backend executes anything, so a state-changing call that gets this was NOT done."""
+
+
+class LedgerForbidden(LedgerHTTPError):         # 403: authenticated, but not allowed to do this
+    """Never retried; the operation was not executed."""
+
+
 class LedgerConflict(LedgerHTTPError):          # 409
     """For propose: ambiguous customer. detail is {"message", "clarification_prompt", "candidates": [...]}."""
 

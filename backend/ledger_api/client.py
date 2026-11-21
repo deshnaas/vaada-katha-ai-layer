@@ -20,27 +20,39 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from . import models as m
 from .config import LedgerAPIConfig
-from .errors import (LedgerBadResponse, LedgerConflict, LedgerHTTPError, LedgerNotFound, LedgerRejected,
-                     LedgerTimeout, LedgerUnavailable, LedgerValidation)
+from .errors import (LedgerBadResponse, LedgerConflict, LedgerForbidden, LedgerHTTPError, LedgerNotFound,
+                     LedgerRejected, LedgerTimeout, LedgerUnauthorized, LedgerUnavailable, LedgerValidation)
 
 log = logging.getLogger("vaada.ledger_api")
 
-# transport(method, url, body_bytes_or_None, timeout_s, max_bytes) -> (status_code, response_bytes)
-Transport = Callable[[str, str, Optional[bytes], float, int], Tuple[int, bytes]]
+# transport(method, url, body_bytes_or_None, timeout_s, max_bytes[, headers]) -> (status_code, response_bytes)
+# `headers` (a dict) is passed ONLY when the client has a merchant token, so older 5-argument transports keep working.
+Transport = Callable[..., Tuple[int, bytes]]
 
 _PROPOSAL_ID = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 INTENTS = ("add_credit", "record_payment")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: urllib would forward the Authorization header to wherever it points."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def urllib_transport(method: str, url: str, body: Optional[bytes], timeout: float,
-                     max_bytes: int) -> Tuple[int, bytes]:
+                     max_bytes: int, headers: Optional[dict] = None) -> Tuple[int, bytes]:
     """The real network call. Error statuses are returned (not raised); connectivity problems raise."""
-    headers = {"Accept": "application/json"}
+    hdrs = {"Accept": "application/json"}
     if body is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+        hdrs["Content-Type"] = "application/json"
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=body, method=method, headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             return resp.status, resp.read(max_bytes + 1)
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read(max_bytes + 1)
@@ -68,6 +80,12 @@ class LedgerAPIClient:
         self.config = config or LedgerAPIConfig.from_env()
         self._transport = transport or urllib_transport
         self._sleep = sleep
+        # The merchant identity is the backend's: we only carry its token, never a merchant id of our own making.
+        self._auth_headers = ({"Authorization": f"Bearer {self.config.api_token}"} if self.config.api_token else None)
+        if self._auth_headers:
+            host = (urllib.parse.urlparse(self.config.base_url).hostname or "").lower()
+            if self.config.base_url.lower().startswith("http://") and host not in ("127.0.0.1", "localhost", "::1"):
+                log.warning("a merchant token is sent over unencrypted HTTP to a non-local host; use HTTPS")
 
     # ------------------------------------------------------------------ core request
     def _request(self, method: str, template: str, path: str, *, query: Optional[dict] = None,
@@ -82,7 +100,11 @@ class LedgerAPIClient:
         for i in range(attempts):
             started = time.monotonic()
             try:
-                status, raw = self._transport(method, url, data, cfg.timeout_s, cfg.max_response_bytes)
+                if self._auth_headers:
+                    status, raw = self._transport(method, url, data, cfg.timeout_s, cfg.max_response_bytes,
+                                                  self._auth_headers)
+                else:
+                    status, raw = self._transport(method, url, data, cfg.timeout_s, cfg.max_response_bytes)
             except (LedgerTimeout, LedgerUnavailable) as exc:
                 last = exc
                 log.warning("ledger %s %s -> %s (attempt %d/%d)", method, template, type(exc).__name__, i + 1, attempts)
@@ -119,8 +141,8 @@ class LedgerAPIClient:
                 raise LedgerBadResponse("empty reply")
             return payload
         detail = payload.get("detail") if isinstance(payload, dict) else None
-        cls = {400: LedgerRejected, 404: LedgerNotFound, 409: LedgerConflict, 422: LedgerValidation}.get(
-            status, LedgerHTTPError)
+        cls = {400: LedgerRejected, 401: LedgerUnauthorized, 403: LedgerForbidden, 404: LedgerNotFound,
+               409: LedgerConflict, 422: LedgerValidation}.get(status, LedgerHTTPError)
         raise cls(status, detail)
 
     # ------------------------------------------------------------------ validation helpers

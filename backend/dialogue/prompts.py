@@ -157,6 +157,9 @@ REPEAT_BY_CODE = {
 # ------------------------------------------------------------------ ledger-backend messages
 BACKEND_DOWN = "Server se connect nahi ho paya, isliye entry nahi ki. Thodi der baad dobara bolein."
 BACKEND_REJECTED = "Backend ne ye entry manzoor nahi ki, isliye save nahi hui."
+AUTH_FAILED = ("Aapka dukaan ka login valid nahi hai ya expire ho gaya hai, isliye entry nahi ki. "
+               "Dobara login karke bolein.")
+AUTH_FAILED_CONFIRM = ("Login valid nahi raha, isliye ye entry save nahi hui. Dobara login karke entry phir se bolein.")
 PROMISE_NOT_SUPPORTED = "Promise abhi backend mein save nahi ho sakta, isliye nahi likha."
 DATE_NOT_SUPPORTED = "Purani tareekh ki entry abhi backend support nahi karta, isliye nahi likhi. Aaj ki entry bolein."
 CUSTOMER_UNRESOLVABLE = ("Is naam ke kai customers hain aur pehchaan nahi ban paayi, isliye entry nahi ki. "

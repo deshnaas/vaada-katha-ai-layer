@@ -46,7 +46,14 @@ def test_bad_limits_are_rejected(kw):
 
 
 def test_no_credentials_are_part_of_the_config():
-    assert not [f for f in LedgerAPIConfig.__dataclass_fields__ if any(w in f for w in ("key", "token", "secret", "password"))]
+    # UPDATED when the backend gained per-merchant authentication: the config may now carry ONE optional credential, the
+    # merchant's session token. The original intent is kept and made stricter: nothing else credential-like exists, the
+    # token is unset by default, and its value can never leak through repr()/str().
+    cred = [f for f in LedgerAPIConfig.__dataclass_fields__ if any(w in f for w in ("key", "token", "secret", "password"))]
+    assert cred == ["api_token"]
+    assert LedgerAPIConfig().api_token is None
+    shown = repr(LedgerAPIConfig(api_token="abcdefgh12345678")) + str(LedgerAPIConfig(api_token="abcdefgh12345678"))
+    assert "abcdefgh12345678" not in shown
 
 
 # ====================================================================== money text

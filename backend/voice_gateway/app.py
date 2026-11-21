@@ -9,13 +9,14 @@ never confirms anything itself, and never logs transcripts, names, amounts or pr
 Run (from backend/):  uvicorn voice_gateway.app:app --host 0.0.0.0 --port 8100     Swagger UI: /docs
 """
 import base64
+import contextlib
 import io
 import logging
 import os
 import re
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,6 +33,8 @@ from dialogue import DialogueManager
 from dialogue import models as M
 from ledger_api import LedgerAPIClient, LedgerAPIConfig
 from ledger_api.adapter import LedgerAdapter
+from ledger_api.config import valid_token
+from ledger_api.merchant import MerchantLedgerRouter, mode_from_env
 from voice_auth.api import get_voice_auth, router as voice_auth_router
 from voice_auth.service import VoiceAuthService
 from voice_gateway import gnani_stt as G
@@ -56,8 +59,9 @@ SPOKEN = {                                                        # short Hindi-
     "STT_BAD_RESPONSE": "Awaaz samajh nahi aayi, dobara bolein.",
     "INTERNAL": "Kuch gadbad ho gayi. Dobara try karein.",
     "AUTH_REQUIRED": "Pehle awaaz se verify karein.",       # only when VAADA_VOICE_AUTH_MODE=enforce
+    "MERCHANT_AUTH_REQUIRED": "Dukaan ka login chahiye. Pehle login karein.",   # only when VAADA_LEDGER_AUTH_MODE=passthrough
 }
-HTTP_STATUS = {"AUTH_REQUIRED": 401, "BAD_REQUEST": 422, "BAD_AUDIO": 400, "AUDIO_TOO_LARGE": 413, "STT_TIMEOUT": 504,
+HTTP_STATUS = {"MERCHANT_AUTH_REQUIRED": 401, "AUTH_REQUIRED": 401, "BAD_REQUEST": 422, "BAD_AUDIO": 400, "AUDIO_TOO_LARGE": 413, "STT_TIMEOUT": 504,
                "STT_UNAVAILABLE": 503, "STT_RATE_LIMITED": 429, "STT_AUTH": 502, "STT_NOT_CONFIGURED": 503,
                "STT_BAD_RESPONSE": 502, "INTERNAL": 500}
 
@@ -152,15 +156,26 @@ class Services:
     manager: DialogueManager
     adapter: LedgerAdapter
     tts: Optional[T.GnaniTTS] = None          # optional audio layer; None = no TTS
+    router: Optional[MerchantLedgerRouter] = None     # merchant-scoped ledger access; None = legacy single adapter
 
 
 _services: Optional[Services] = None
 
 
 def build_services() -> Services:
-    adapter = LedgerAdapter(LedgerAPIClient(LedgerAPIConfig.from_env()))
-    manager = DialogueManager(120, ledger=adapter, query_resolver=adapter.answer_query)
-    return Services(stt=G.GnaniSTT(), manager=manager, adapter=adapter, tts=T.GnaniTTS())
+    """VAADA_LEDGER_AUTH_MODE: none (default, legacy) | static | passthrough. See ledger_api/merchant.py.
+    An invalid mode or a static mode without a token raises here: authentication must never silently degrade."""
+    cfg = LedgerAPIConfig.from_env()
+    mode = mode_from_env()
+    if mode == "none":
+        adapter = LedgerAdapter(LedgerAPIClient(cfg))
+        manager = DialogueManager(120, ledger=adapter, query_resolver=adapter.answer_query)
+        return Services(stt=G.GnaniSTT(), manager=manager, adapter=adapter, tts=T.GnaniTTS())
+    router = MerchantLedgerRouter(cfg, mode)
+    manager = DialogueManager(120, ledger=router, query_resolver=router.answer_query)
+    # `adapter` is unused in router mode (every call goes through the router); it carries no token.
+    unused = LedgerAdapter(LedgerAPIClient(replace(cfg, api_token=None)))
+    return Services(stt=G.GnaniSTT(), manager=manager, adapter=unused, tts=T.GnaniTTS(), router=router)
 
 
 def get_services() -> Services:
@@ -183,6 +198,29 @@ app = FastAPI(
 
 app.include_router(voice_auth_router)                  # additive: /v1/auth/* and /v1/admin/voiceprints/*
 _session_account: "OrderedDict[str, str]" = OrderedDict()      # gateway session -> account it was last authenticated as
+_session_merchant: "OrderedDict[str, str]" = OrderedDict()     # gateway session -> fingerprint of the merchant token it used
+
+
+def _bearer(header: Optional[str]) -> Optional[str]:
+    """The token of an `Authorization: Bearer <token>` header, or None if absent or malformed (never echoed)."""
+    parts = (header or "").strip().split(" ")
+    if len(parts) == 2 and parts[0].lower() == "bearer" and valid_token(parts[1]):
+        return parts[1]
+    return None
+
+
+def _bind_session_to_merchant(services: "Services", session_id: str, merchant_fp: Optional[str]) -> None:
+    """One gateway session belongs to one merchant: if a different merchant's token shows up on the same session, the
+    dialogue state (including a pending confirmation) is discarded, so it can never be confirmed under another merchant."""
+    if merchant_fp is None:
+        return
+    previous = _session_merchant.get(session_id)
+    if previous is not None and previous != merchant_fp:
+        services.manager.end_session(session_id)
+    _session_merchant[session_id] = merchant_fp
+    _session_merchant.move_to_end(session_id)
+    while len(_session_merchant) > 10_000:
+        _session_merchant.popitem(last=False)
 
 
 @app.exception_handler(GatewayError)
@@ -292,6 +330,11 @@ def voice_turn(
     x_voice_auth_token: Optional[str] = Header(None, description="Voice-authentication token from POST /v1/auth/verify. "
                                                                   "Only checked when the gateway runs with "
                                                                   "VAADA_VOICE_AUTH_MODE=enforce; ignored otherwise."),
+    authorization: Optional[str] = Header(None, description="Merchant backend session token as `Bearer <token>`. REQUIRED when "
+                                                            "the gateway runs with VAADA_LEDGER_AUTH_MODE=passthrough "
+                                                            "(forwarded unchanged to the ledger backend, which resolves the "
+                                                            "merchant); ignored in the other modes. A merchant id in the "
+                                                            "request is never accepted."),
     services: Services = Depends(get_services),
     auth: VoiceAuthService = Depends(get_voice_auth),
 ):
@@ -310,6 +353,10 @@ def voice_turn(
         _session_account.move_to_end(session_id)
         while len(_session_account) > 10_000:
             _session_account.popitem(last=False)
+    merchant_token = _bearer(authorization)
+    if services.router is not None and services.router.mode == "passthrough" and merchant_token is None:
+        # merchant identity is the backend's: without a token no ledger operation is even attempted (and no STT is spent)
+        raise GatewayError("MERCHANT_AUTH_REQUIRED", "a valid merchant session token is required (Authorization: Bearer ...)")
     if client_msg_id is not None and not MSG_ID_RE.match(client_msg_id):
         raise GatewayError("BAD_REQUEST", "client_msg_id has invalid characters")
     lang = G.normalise_language(language)
@@ -336,10 +383,14 @@ def voice_turn(
                                  reply=Reply(text=spoken, speak=[spoken], kind="UNCLEAR"),
                                  audio=_speak(services, [spoken], want_audio))
 
+    router = services.router
+    scope = router.bind(merchant_token) if router is not None else contextlib.nullcontext(None)
     try:
-        result = services.manager.process_text(
-            session_id, stt.text, known_customers=services.adapter.known_customers(), today=date.today(),
-            message_id=client_msg_id)
+        with scope as merchant_fp:           # every ledger call below is made as THIS request's merchant
+            _bind_session_to_merchant(services, session_id, merchant_fp if router is not None else None)
+            known = router.known_customers() if router is not None else services.adapter.known_customers()
+            result = services.manager.process_text(
+                session_id, stt.text, known_customers=known, today=date.today(), message_id=client_msg_id)
     except Exception as exc:                         # the manager is built not to raise; never leak internals if it does
         log.error("voice turn: dialogue failed (%s)", type(exc).__name__)
         raise GatewayError("INTERNAL", "dialogue failed", recoverable=True) from None
@@ -362,7 +413,10 @@ def voice_turn(
 @app.get("/health", tags=["System"], summary="Gateway status (no secrets)")
 def health(services: Services = Depends(get_services)) -> Dict[str, Any]:
     try:
-        services.adapter._client.health()
+        if services.router is not None:
+            services.router.health()
+        else:
+            services.adapter._client.health()
         ledger = True
     except Exception:
         ledger = False

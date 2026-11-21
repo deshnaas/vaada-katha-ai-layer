@@ -8,9 +8,10 @@ implementation. It never imports the backend's database and never opens a SQLite
 """
 from .client import LedgerAPIClient, rupees_text
 from .config import LedgerAPIConfig
-from .errors import (LedgerAPIError, LedgerBadResponse, LedgerConflict, LedgerHTTPError, LedgerNotFound,
-                     LedgerRejected, LedgerTimeout, LedgerUnavailable, LedgerValidation)
+from .errors import (LedgerAPIError, LedgerBadResponse, LedgerConflict, LedgerForbidden, LedgerHTTPError,
+                     LedgerNotFound, LedgerRejected, LedgerTimeout, LedgerUnauthorized, LedgerUnavailable,
+                     LedgerValidation)
 
 __all__ = ["LedgerAPIClient", "LedgerAPIConfig", "rupees_text", "LedgerAPIError", "LedgerBadResponse",
-           "LedgerConflict", "LedgerHTTPError", "LedgerNotFound", "LedgerRejected", "LedgerTimeout",
-           "LedgerUnavailable", "LedgerValidation"]
+           "LedgerConflict", "LedgerForbidden", "LedgerHTTPError", "LedgerNotFound", "LedgerRejected",
+           "LedgerTimeout", "LedgerUnauthorized", "LedgerUnavailable", "LedgerValidation"]

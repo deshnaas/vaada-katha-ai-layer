@@ -17,8 +17,11 @@ from dialogue import ports as pt
 from dialogue.prompts import format_rupees
 
 from .client import LedgerAPIClient
-from .errors import (LedgerAPIError, LedgerBadResponse, LedgerConflict, LedgerHTTPError, LedgerNotFound,
-                     LedgerRejected, LedgerTimeout, LedgerUnavailable, LedgerValidation)
+from .errors import (LedgerAPIError, LedgerBadResponse, LedgerConflict, LedgerForbidden, LedgerHTTPError,
+                     LedgerNotFound, LedgerRejected, LedgerTimeout, LedgerUnauthorized, LedgerUnavailable,
+                     LedgerValidation)
+
+AUTH_READ_MESSAGE = "Aapka dukaan ka login valid nahi hai ya expire ho gaya hai. Dobara login karke poochein."
 
 log = logging.getLogger("vaada.ledger_api")
 _INTENT = {"ADD_CREDIT": "add_credit", "RECORD_PAYMENT": "record_payment"}
@@ -88,6 +91,8 @@ class LedgerAdapter:
                 return pt.ProposalOutcome(pt.P_CUSTOMER_UNRESOLVABLE, reason="backend_still_ambiguous")
             cands = tuple(self._candidate(c) for c in exc.candidates if isinstance(c, dict))
             return pt.ProposalOutcome(pt.P_CUSTOMER_AMBIGUOUS, candidates=cands, reason="ambiguous")
+        except (LedgerUnauthorized, LedgerForbidden):
+            return pt.ProposalOutcome(pt.P_UNAUTHORIZED, reason="merchant_auth_failed")
         except LedgerNotFound:
             return pt.ProposalOutcome(pt.P_CUSTOMER_NOT_FOUND, reason="customer_not_found")
         except (LedgerRejected, LedgerValidation):
@@ -149,6 +154,8 @@ class LedgerAdapter:
     def confirm(self, proposal_id: str) -> pt.ConfirmOutcome:
         try:
             info = self._client.confirm(proposal_id)
+        except (LedgerUnauthorized, LedgerForbidden):
+            return pt.ConfirmOutcome(pt.C_UNAUTHORIZED, reason="merchant_auth_failed")
         except (LedgerRejected, LedgerNotFound, LedgerValidation):
             return pt.ConfirmOutcome(pt.C_REJECTED, reason="not_confirmable")
         except (LedgerTimeout, LedgerUnavailable):
@@ -187,6 +194,8 @@ class LedgerAdapter:
     def answer_query(self, cmd) -> Optional[str]:
         try:
             return self._answer(cmd)
+        except (LedgerUnauthorized, LedgerForbidden):
+            return AUTH_READ_MESSAGE
         except LedgerAPIError:
             return "Server se jawab nahi mila. Thodi der baad dobara poochein."
         except Exception as exc:
