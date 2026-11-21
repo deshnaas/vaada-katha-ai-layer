@@ -1,0 +1,28 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+app/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Explicitly exclude skill & prompt files
+VAADA_KHATA_skill.md
+
+# Android / Gradle generated files
+.gradle/
+**/build/
+local.properties
+.DS_Store
+
+# Private project notes
+VAADA_KHATA_skill.md
