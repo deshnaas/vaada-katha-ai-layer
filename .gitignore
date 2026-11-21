@@ -1,0 +1,15 @@
+.env
+*.db
+__pycache__/
+.venv/
+*.pyc
+backend/out/
+
+# local secrets variants (the template .env.example stays tracked)
+.env.*
+!.env.example
+
+# local data / caches
+*.sqlite
+*.sqlite3
+.pytest_cache/
