@@ -12,6 +12,10 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.suxsem.androidwakeword.WakeWordDetector
 import com.vaada.audio.AudioCaptureManager
+import com.vaada.network.VoiceGatewayClient
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
 import com.vaada.models.AssistantState
 import com.vaada.models.AudioCaptureMetadata
 import kotlinx.coroutines.CoroutineScope
@@ -100,6 +104,10 @@ class VaadaAudioService : Service() {
     private var wakeWordDetector: WakeWordDetector? = null
     private var wakeWordJob: Job? = null
 
+    // Voice Gateway
+    private val voiceGatewayClient = VoiceGatewayClient()
+    private val sessionId: String = UUID.randomUUID().toString()
+
     // Concurrency & Handoff guards
     private val isServiceRunning = AtomicBoolean(false)
     private val isHandoffInProgress = AtomicBoolean(false)
@@ -119,14 +127,49 @@ class VaadaAudioService : Service() {
             onAmplitudeUpdate = { normalizedRms ->
                 _assistantState.value = AssistantState.Listening(normalizedRms)
             }
-            onCaptureCompleted = { metadata, _ ->
+            onCaptureCompleted = { metadata, pcmFile ->
                 Log.i(TAG, "Audio capture finished. Bytes: ${metadata.totalBytes}, Duration: ${metadata.durationMs} ms")
                 _lastCapturedMetadata.value = metadata
                 _assistantState.value = AssistantState.Captured(metadata)
                 updateNotification(isRecording = false)
 
-                // Resume Wake-Word Standby Listener after recording completes
-                resumeWakeWordStandbyAfterCapture()
+                // ── Gateway upload ──────────────────────────────────────────
+                // AudioRecord is already released by AudioCaptureManager before this callback fires.
+                val clientMsgId = UUID.randomUUID().toString()
+                serviceScope.launch(Dispatchers.IO) {
+                    try {
+                        if (pcmFile == null || !pcmFile.exists()) {
+                            Log.e(TAG, "PCM file missing – skipping gateway upload")
+                            resumeWakeWordStandbyAfterCapture()
+                            return@launch
+                        }
+                        val wavFile = File(cacheDir, "last_utterance.wav")
+                        pcmToWav(pcmFile, wavFile)
+
+                        Log.i(TAG, "Sending to gateway [session=$sessionId, clientMsgId=$clientMsgId, wavBytes=${wavFile.length()}]")
+                        val result = voiceGatewayClient.sendTurn(
+                            audioFile   = wavFile,
+                            sessionId   = sessionId,
+                            clientMsgId = clientMsgId,
+                            language    = "hi-IN,en-IN"
+                        )
+                        Log.i(TAG,
+                            "Gateway OK | status=${result.status} | transcript=\"${result.transcript}\" " +
+                            "| replyText=\"${result.replyText}\" | kind=${result.replyKind} " +
+                            "| dialogueState=${result.dialogueState} | ledgerCommitted=${result.ledgerCommitted} " +
+                            "| duplicate=${result.duplicate}"
+                        )
+                        if (result.ledgerCommitted) {
+                            Log.i(TAG, "LEDGER COMMITTED – transaction saved by gateway (txId=${result.ledgerTransactionId})")
+                        }
+                        // TTS will be added in a future task; speak is logged only for now.
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Unexpected error during gateway upload", e)
+                        _assistantState.value = AssistantState.Error("Unexpected error: ${e.message}")
+                    } finally {
+                        resumeWakeWordStandbyAfterCapture()
+                    }
+                }
             }
             onError = { errorMessage ->
                 Log.e(TAG, "AudioCaptureManager error: $errorMessage")
@@ -162,6 +205,43 @@ class VaadaAudioService : Service() {
 
         return START_STICKY
     }
+
+    // ── PCM → WAV conversion ───────────────────────────────────────────────────
+    private fun pcmToWav(pcmFile: File, wavFile: File) {
+        val pcmBytes = pcmFile.readBytes()
+        val sampleRate = 16000
+        val channels: Short = 1
+        val bitsPerSample: Short = 16
+        val byteRate = sampleRate * channels * (bitsPerSample / 8)
+        val blockAlign = (channels * (bitsPerSample / 8)).toShort()
+        val dataLen = pcmBytes.size
+        val chunkSize = 36 + dataLen
+        fun Int.le4(): ByteArray = byteArrayOf(
+            (this and 0xFF).toByte(), ((this shr 8) and 0xFF).toByte(),
+            ((this shr 16) and 0xFF).toByte(), ((this shr 24) and 0xFF).toByte()
+        )
+        fun Short.le2(): ByteArray = byteArrayOf(
+            (this.toInt() and 0xFF).toByte(), ((this.toInt() shr 8) and 0xFF).toByte()
+        )
+        FileOutputStream(wavFile).use { out ->
+            out.write("RIFF".toByteArray(Charsets.US_ASCII))
+            out.write(chunkSize.le4())
+            out.write("WAVE".toByteArray(Charsets.US_ASCII))
+            out.write("fmt ".toByteArray(Charsets.US_ASCII))
+            out.write(16.le4())                      // Subchunk1Size = 16 for PCM
+            out.write((1).toShort().le2())            // AudioFormat = 1 (PCM)
+            out.write(channels.le2())
+            out.write(sampleRate.le4())
+            out.write(byteRate.le4())
+            out.write(blockAlign.le2())
+            out.write(bitsPerSample.le2())
+            out.write("data".toByteArray(Charsets.US_ASCII))
+            out.write(dataLen.le4())
+            out.write(pcmBytes)
+        }
+        Log.d(TAG, "PCM→WAV: ${pcmFile.length()} PCM bytes → ${wavFile.length()} WAV bytes")
+    }
+    // ──────────────────────────────────────────────────────────────────────────
 
     private fun handleStartService() {
         promoteToForeground(isRecording = false)

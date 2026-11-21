@@ -62,4 +62,5 @@ dependencies {
     implementation(libs.androidx.material3)
 
     debugImplementation(libs.androidx.ui.tooling)
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
