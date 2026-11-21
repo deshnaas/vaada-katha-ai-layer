@@ -75,6 +75,13 @@ class VaadaAudioService : Service() {
 
         private var peakDecayJob: Job? = null
 
+        // Merchant login token is held in memory only and supplied by MainActivity.
+        @Volatile private var merchantBearerToken: String? = null
+
+        fun setMerchantToken(token: String?) {
+            merchantBearerToken = token?.takeIf { it.isNotBlank() }
+        }
+
         // ── Voice Auth Session (in-memory, never persisted) ─────────────────
         private val _voiceAuthSession = MutableStateFlow<VoiceAuthSession>(VoiceAuthSession.None)
         val voiceAuthSession: StateFlow<VoiceAuthSession> = _voiceAuthSession.asStateFlow()
@@ -138,6 +145,7 @@ class VaadaAudioService : Service() {
     private val isServiceRunning = AtomicBoolean(false)
     private val isHandoffInProgress = AtomicBoolean(false)
     private val isManualRecordingActive = AtomicBoolean(false)
+    private val isConversationActive = AtomicBoolean(false)
 
     override fun onCreate() {
         super.onCreate()
@@ -175,11 +183,14 @@ class VaadaAudioService : Service() {
                         pcmToWav(pcmFile, wavFile)
 
                         Log.i(TAG, "Sending to gateway [session=$sessionId, clientMsgId=$clientMsgId, wavBytes=${wavFile.length()}]")
+                        val currentMerchantToken = merchantBearerToken
+                            ?: throw java.io.IOException("Merchant session missing. Please log in again.")
                         val result = voiceGatewayClient.sendTurn(
-                            audioFile   = wavFile,
-                            sessionId   = sessionId,
-                            clientMsgId = clientMsgId,
-                            language    = "hi-IN,en-IN"
+                            audioFile    = wavFile,
+                            sessionId    = sessionId,
+                            merchantToken = currentMerchantToken,
+                            clientMsgId  = clientMsgId,
+                            language     = "hi-IN,en-IN"
                         )
                         Log.i(TAG,
                             "Gateway OK | status=${result.status} | transcript=\"${result.transcript}\" " +
@@ -190,6 +201,22 @@ class VaadaAudioService : Service() {
                         if (result.ledgerCommitted) {
                             Log.i(TAG, "LEDGER COMMITTED – transaction saved (txId=${result.ledgerTransactionId})")
                         }
+                        val awaitingValue = result.awaiting?.trim()?.lowercase().orEmpty()
+                        val stateValue = result.dialogueState?.trim()?.lowercase().orEmpty()
+
+                        val confirmationPending =
+                            awaitingValue.contains("confirm") ||
+                                    awaitingValue == "yes_no" ||
+                                    stateValue.contains("awaiting_confirmation") ||
+                                    stateValue.contains("awaiting confirmation")
+
+                        isConversationActive.set(confirmationPending)
+
+                        Log.i(
+                            TAG,
+                            "Conversation status: pending=$confirmationPending, " +
+                                    "awaiting=${result.awaiting}, state=${result.dialogueState}"
+                        )
                         // Transition to Responding state so the UI can display reply
                         _assistantState.value = AssistantState.Responding(
                             transcript      = result.transcript,
@@ -219,7 +246,30 @@ class VaadaAudioService : Service() {
                         Log.e(TAG, "Unexpected error during gateway upload", e)
                         _assistantState.value = AssistantState.Error("Unexpected error: ${e.message}")
                     } finally {
-                        resumeWakeWordStandbyAfterCapture()
+                        if (isConversationActive.get() && isServiceRunning.get()) {
+                            Log.i(TAG, "Confirmation pending. Listening again without wake word...")
+
+                            serviceScope.launch(Dispatchers.Main) {
+                                delay(400)
+
+                                if (isConversationActive.get() && isServiceRunning.get()) {
+                                    _assistantState.value = AssistantState.Listening(0f)
+                                    updateNotification(isRecording = true)
+
+                                    try {
+                                        audioCaptureManager.startCapture(serviceScope)
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "Failed to continue confirmation listening", e)
+                                        isConversationActive.set(false)
+                                        resumeWakeWordStandbyAfterCapture()
+                                    }
+                                } else {
+                                    resumeWakeWordStandbyAfterCapture()
+                                }
+                            }
+                        } else {
+                            resumeWakeWordStandbyAfterCapture()
+                        }
                     }
                 }
             }
@@ -623,6 +673,7 @@ class VaadaAudioService : Service() {
         isServiceRunning.set(false)
         isHandoffInProgress.set(false)
         isManualRecordingActive.set(false)
+        isConversationActive.set(false)
 
         audioCaptureManager.release()
         stopWakeWordDetectorOnly()

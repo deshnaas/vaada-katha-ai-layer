@@ -40,6 +40,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
 import com.vaada.network.KhataApiClient
+import com.vaada.network.MerchantAuthClient
 
 class MainActivity : ComponentActivity() {
 
@@ -83,6 +84,10 @@ class MainActivity : ComponentActivity() {
                 // ── Auth state ────────────────────────────────────────────────
                 var authState: AuthState by remember { mutableStateOf(AuthState.Unauthenticated) }
                 var merchantProfile: MerchantProfile? by remember { mutableStateOf(null) }
+                var merchantToken by remember { mutableStateOf<String?>(null) }
+                var loginPin by remember { mutableStateOf("") }
+                var signupPin by remember { mutableStateOf("") }
+                val merchantAuthClient = remember { MerchantAuthClient() }
 
                 // ── Voice Verify: enrollment-capture recording state ──────────
                 // Tracks whether the user is currently recording for voice verification
@@ -97,25 +102,39 @@ class MainActivity : ComponentActivity() {
                 }
 
                 fun loadKhata() {
+                    val token = merchantToken
+                    if (token.isNullOrBlank()) {
+                        khataState = KhataUiState.Error("Your session is missing. Please log in again.")
+                        return
+                    }
+
                     khataState = KhataUiState.Loading
                     scope.launch {
                         try {
-                            val customers = KhataApiClient().loadCustomers()
+                            // Every protected ledger request uses the authenticated merchant session.
+                            val customers = KhataApiClient(sessionToken = token).loadCustomers()
                             khataState = KhataUiState.Success(
                                 customers = customers,
                                 totalOutstanding = customers.sumOf { it.currentBalance },
                                 outstandingCount = customers.count { it.currentBalance > 0 }
                             )
+                        } catch (e: com.vaada.network.KhataApiException) {
+                            if (e.statusCode == 401) {
+                                merchantToken = null
+                                    VaadaAudioService.setMerchantToken(null)
+                                merchantProfile = null
+                                VaadaAudioService.resetVoiceAuth()
+                                authState = AuthState.Unauthenticated
+                                khataState = KhataUiState.Error("Your session expired. Please log in again.")
+                            } else {
+                                khataState = KhataUiState.Error(e.message ?: "Unable to load customer accounts")
+                            }
                         } catch (e: Exception) {
                             khataState = KhataUiState.Error(
                                 e.message ?: "Unable to load customer accounts"
                             )
                         }
                     }
-                }
-
-                LaunchedEffect(Unit) {
-                    loadKhata()
                 }
 
                 // ── Navigation state ──────────────────────────────────────────
@@ -138,8 +157,8 @@ class MainActivity : ComponentActivity() {
                         // ── Auth screens ───────────────────────────────────────────
                         is AuthState.Unauthenticated -> {
                             WelcomeScreen(
-                                onLoginClick = { authState = AuthState.PhoneEntry() },
-                                onSignupClick = { authState = AuthState.SignupEntry(phone = "") }
+                                onLoginClick = { loginPin = ""; authState = AuthState.PhoneEntry() },
+                                onSignupClick = { signupPin = ""; authState = AuthState.SignupEntry(phone = "") }
                             )
                         }
 
@@ -147,48 +166,54 @@ class MainActivity : ComponentActivity() {
                             val s = authState as AuthState.PhoneEntry
                             LoginScreen(
                                 phone = s.phone,
+                                pin = loginPin,
                                 onPhoneChange = { authState = s.copy(phone = it, error = null) },
+                                onPinChange = { loginPin = it },
                                 loading = s.loading,
                                 error = s.error,
-                                onSendOtp = {
-                                    // Auth backend not connected — dev bypass: build a placeholder profile
-                                    // and move to voice verification step.
-                                    val profile = MerchantProfile(
-                                        id = "dev",
-                                        merchantName = "Dev User",
-                                        shopName = "श्री किराना स्टोर्स",
-                                        phone = s.phone
-                                    )
-                                    merchantProfile = profile
-                                    // Reset any stale voice auth session for this account before starting
-                                    VaadaAudioService.resetVoiceAuth()
-                                    authState = AuthState.VoiceVerify(profile)
+                                onLogin = {
+                                    if (s.phone.length != 10 || loginPin.length != 6) {
+                                        authState = s.copy(error = "Enter your 10-digit phone number and 6-digit PIN.")
+                                    } else {
+                                        authState = s.copy(loading = true, error = null)
+                                        scope.launch {
+                                            try {
+                                                val session = merchantAuthClient.login(s.phone, loginPin)
+                                                merchantToken = session.token
+                                                VaadaAudioService.setMerchantToken(session.token)
+                                                merchantProfile = MerchantProfile(
+                                                    id = session.profile.userId.toString(),
+                                                    merchantName = session.profile.name,
+                                                    shopName = session.profile.shopName,
+                                                    phone = session.profile.phone
+                                                )
+                                                loginPin = ""
+                                                VaadaAudioService.resetVoiceAuth()
+                                                authState = AuthState.Authenticated
+                                                loadKhata()
+                                            } catch (e: Exception) {
+                                                authState = (authState as? AuthState.PhoneEntry
+                                                    ?: s).copy(
+                                                    loading = false,
+                                                    error = e.message ?: "Login failed. Please try again."
+                                                )
+                                            }
+                                        }
+                                    }
                                 },
-                                onBack = { authState = AuthState.Unauthenticated }
+                                onBack = {
+                                    loginPin = ""
+                                    authState = AuthState.Unauthenticated
+                                }
                             )
                         }
 
                         is AuthState.OtpEntry -> {
-                            val s = authState as AuthState.OtpEntry
-                            OtpScreen(
-                                phone = s.phone,
-                                otp = s.otp,
-                                onOtpChange = { authState = s.copy(otp = it, error = null) },
-                                loading = s.loading,
-                                error = s.error,
-                                onVerify = {
-                                    val profile = MerchantProfile(
-                                        id = "dev",
-                                        merchantName = "Dev User",
-                                        shopName = "श्री किराना स्टोर्स",
-                                        phone = s.phone
-                                    )
-                                    merchantProfile = profile
-                                    VaadaAudioService.resetVoiceAuth()
-                                    authState = AuthState.VoiceVerify(profile)
-                                },
-                                onResend = { /* no-op until auth backend is connected */ },
-                                onBack = { authState = AuthState.PhoneEntry(phone = s.phone) }
+                            // OTP is not part of the current backend contract. This legacy state
+                            // is retained in AuthState for compatibility but is never entered.
+                            WelcomeScreen(
+                                onLoginClick = { loginPin = ""; authState = AuthState.PhoneEntry() },
+                                onSignupClick = { signupPin = ""; authState = AuthState.SignupEntry(phone = "") }
                             )
                         }
 
@@ -196,24 +221,55 @@ class MainActivity : ComponentActivity() {
                             val s = authState as AuthState.SignupEntry
                             SignupScreen(
                                 phone = s.phone,
+                                pin = signupPin,
                                 merchantName = s.merchantName,
                                 shopName = s.shopName,
+                                onPhoneChange = { authState = s.copy(phone = it, error = null) },
+                                onPinChange = { signupPin = it },
                                 onMerchantNameChange = { authState = s.copy(merchantName = it, error = null) },
                                 onShopNameChange = { authState = s.copy(shopName = it, error = null) },
                                 loading = s.loading,
                                 error = s.error,
                                 onSubmit = {
-                                    val profile = MerchantProfile(
-                                        id = "dev",
-                                        merchantName = s.merchantName.ifBlank { "Dev User" },
-                                        shopName = s.shopName.ifBlank { "My Shop" },
-                                        phone = s.phone
-                                    )
-                                    merchantProfile = profile
-                                    VaadaAudioService.resetVoiceAuth()
-                                    authState = AuthState.VoiceVerify(profile)
+                                    if (s.phone.length != 10 || signupPin.length != 6 ||
+                                        s.merchantName.isBlank() || s.shopName.isBlank()) {
+                                        authState = s.copy(error = "Fill in all fields and enter a 6-digit PIN.")
+                                    } else {
+                                        authState = s.copy(loading = true, error = null)
+                                        scope.launch {
+                                            try {
+                                                val session = merchantAuthClient.register(
+                                                    phone = s.phone,
+                                                    name = s.merchantName.trim(),
+                                                    shopName = s.shopName.trim(),
+                                                    pin = signupPin
+                                                )
+                                                merchantToken = session.token
+                                                VaadaAudioService.setMerchantToken(session.token)
+                                                merchantProfile = MerchantProfile(
+                                                    id = session.profile.userId.toString(),
+                                                    merchantName = session.profile.name,
+                                                    shopName = session.profile.shopName,
+                                                    phone = session.profile.phone
+                                                )
+                                                signupPin = ""
+                                                VaadaAudioService.resetVoiceAuth()
+                                                authState = AuthState.Authenticated
+                                                loadKhata()
+                                            } catch (e: Exception) {
+                                                authState = (authState as? AuthState.SignupEntry
+                                                    ?: s).copy(
+                                                    loading = false,
+                                                    error = e.message ?: "Registration failed. Please try again."
+                                                )
+                                            }
+                                        }
+                                    }
                                 },
-                                onBack = { authState = AuthState.Unauthenticated }
+                                onBack = {
+                                    signupPin = ""
+                                    authState = AuthState.Unauthenticated
+                                }
                             )
                         }
 
@@ -267,6 +323,8 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
                                     VaadaAudioService.resetVoiceAuth()
+                                    merchantToken = null
+                                    VaadaAudioService.setMerchantToken(null)
                                     merchantProfile = null
                                     authState = AuthState.Unauthenticated
                                 }
@@ -328,19 +386,22 @@ class MainActivity : ComponentActivity() {
                                             shopName           = merchantProfile?.shopName ?: "",
                                             phone              = merchantProfile?.phone ?: "",
                                             onLogout           = {
-                                                // Server-side logout of voice auth session
-                                                val currentSession = voiceAuthSession
-                                                if (currentSession is VoiceAuthSession.Verified) {
-                                                    scope.launch {
-                                                        try {
-                                                            com.vaada.network.VoiceAuthClient()
-                                                                .logout(currentSession.token)
-                                                        } catch (_: Exception) {}
+                                                val token = merchantToken
+                                                scope.launch {
+                                                    try {
+                                                        if (!token.isNullOrBlank()) merchantAuthClient.logout(token)
+                                                    } catch (e: Exception) {
+                                                        android.util.Log.w("MainActivity", "Merchant logout request failed", e)
+                                                    } finally {
+                                                        merchantToken = null
+                                    VaadaAudioService.setMerchantToken(null)
+                                                        merchantProfile = null
+                                                        loginPin = ""
+                                                        signupPin = ""
+                                                        VaadaAudioService.resetVoiceAuth()
+                                                        authState = AuthState.Unauthenticated
                                                     }
                                                 }
-                                                VaadaAudioService.resetVoiceAuth()
-                                                merchantProfile = null
-                                                authState = AuthState.Unauthenticated
                                             },
                                             modifier = Modifier.padding(innerPadding)
                                         )

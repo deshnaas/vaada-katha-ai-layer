@@ -11,7 +11,13 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
+class KhataApiException(
+    val statusCode: Int,
+    message: String
+) : Exception(message)
+
 class KhataApiClient(
+    private val sessionToken: String,
     private val baseUrl: String = "http://10.115.28.169:8000"
 ) {
     private fun get(path: String): String {
@@ -22,6 +28,8 @@ class KhataApiClient(
             connection.requestMethod = "GET"
             connection.connectTimeout = 10000
             connection.readTimeout = 15000
+            connection.setRequestProperty("Authorization", "Bearer $sessionToken")
+            connection.setRequestProperty("Accept", "application/json")
 
             val code = connection.responseCode
             val stream = if (code in 200..299) {
@@ -33,7 +41,12 @@ class KhataApiClient(
             val body = stream.bufferedReader().use { it.readText() }
 
             if (code !in 200..299) {
-                throw Exception("API error $code: $body")
+                val message = try {
+                    JSONObject(body).optString("detail").takeIf { it.isNotBlank() }
+                } catch (_: Exception) {
+                    null
+                } ?: "Khata request failed (HTTP $code)"
+                throw KhataApiException(code, message)
             }
             return body
         } finally {

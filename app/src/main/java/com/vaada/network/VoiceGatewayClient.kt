@@ -48,11 +48,15 @@ class VoiceGatewayClient(
     suspend fun sendTurn(
         audioFile: File,
         sessionId: String,
+        merchantToken: String,
         clientMsgId: String = UUID.randomUUID().toString(),
         language: String = "hi-IN,en-IN"
     ): VoiceTurnResult = withContext(Dispatchers.IO) {
         require(sessionId.matches(Regex("[A-Za-z0-9_-]{1,64}"))) {
             "Invalid session ID"
+        }
+        require(merchantToken.isNotBlank()) {
+            "Merchant login token is missing. Please log in again."
         }
         require(clientMsgId.matches(Regex("[A-Za-z0-9_:.\\-]{1,100}"))) {
             "Invalid client message ID"
@@ -78,6 +82,7 @@ class VoiceGatewayClient(
 
         val request = Request.Builder()
             .url("${baseUrl.trimEnd('/')}/v1/voice/turn")
+            .header("Authorization", "Bearer ${merchantToken.trim()}")
             .post(multipartBody)
             .build()
 
