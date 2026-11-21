@@ -9,63 +9,37 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
+import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.vaada.models.AssistantState
-import com.vaada.models.AudioCaptureMetadata
+import com.vaada.models.AuthState
+import com.vaada.models.KhataUiState
+import com.vaada.models.MerchantProfile
+import com.vaada.models.VoiceAuthSession
 import com.vaada.service.VaadaAudioService
 import com.vaada.ui.assistant.HomeScreen
+import com.vaada.ui.auth.LoginScreen
+import com.vaada.ui.auth.OtpScreen
+import com.vaada.ui.auth.SignupScreen
+import com.vaada.ui.auth.VoiceVerifyScreen
+import com.vaada.ui.auth.WelcomeScreen
 import com.vaada.ui.components.VaadaBottomBar
 import com.vaada.ui.ledger.KhataScreen
 import com.vaada.ui.navigation.VaadaDestination
-import com.vaada.ui.theme.KiranaCreamBg
-import com.vaada.ui.theme.KiranaGreenPrimary
-import com.vaada.ui.theme.KiranaTextPrimary
-import com.vaada.ui.theme.KiranaTextSecondary
+import com.vaada.ui.settings.SettingsScreen
 import com.vaada.ui.theme.VaadaTheme
+import kotlinx.coroutines.launch
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
+import com.vaada.network.KhataApiClient
 
 class MainActivity : ComponentActivity() {
 
@@ -82,7 +56,10 @@ class MainActivity : ComponentActivity() {
                 val threshold by VaadaAudioService.wakeWordThreshold.collectAsState()
                 val lastEvaluatedScore by VaadaAudioService.lastEvaluatedScore.collectAsState()
 
-                // Permissions check
+                // Voice auth session — observed from service companion StateFlow
+                val voiceAuthSession by VaadaAudioService.voiceAuthSession.collectAsState()
+
+                // ── Permissions ───────────────────────────────────────────────
                 val requiredPermissions = remember {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
@@ -90,74 +67,285 @@ class MainActivity : ComponentActivity() {
                         arrayOf(Manifest.permission.RECORD_AUDIO)
                     }
                 }
-
                 var hasPermissions by remember {
-                    mutableStateOf(
-                        requiredPermissions.all {
-                            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
-                        }
-                    )
+                    mutableStateOf(requiredPermissions.all {
+                        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+                    })
                 }
-
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
-                ) { results ->
-                    hasPermissions = results.values.all { it }
+                ) { results -> hasPermissions = results.values.all { it } }
+
+                LaunchedEffect(Unit) {
+                    if (!hasPermissions) permissionLauncher.launch(requiredPermissions)
+                }
+
+                // ── Auth state ────────────────────────────────────────────────
+                var authState: AuthState by remember { mutableStateOf(AuthState.Unauthenticated) }
+                var merchantProfile: MerchantProfile? by remember { mutableStateOf(null) }
+
+                // ── Voice Verify: enrollment-capture recording state ──────────
+                // Tracks whether the user is currently recording for voice verification
+                // (distinct from wake-word recording which is managed by VaadaAudioService).
+                var isVerifyRecording by remember { mutableStateOf(false) }
+                var verifyAmplitudeRms by remember { mutableStateOf(0f) }
+                val scope = rememberCoroutineScope()
+
+                // ── Khata (ledger) state ──────────────────────────────────────
+                var khataState by remember {
+                    mutableStateOf<KhataUiState>(KhataUiState.Loading)
+                }
+
+                fun loadKhata() {
+                    khataState = KhataUiState.Loading
+                    scope.launch {
+                        try {
+                            val customers = KhataApiClient().loadCustomers()
+                            khataState = KhataUiState.Success(
+                                customers = customers,
+                                totalOutstanding = customers.sumOf { it.currentBalance },
+                                outstandingCount = customers.count { it.currentBalance > 0 }
+                            )
+                        } catch (e: Exception) {
+                            khataState = KhataUiState.Error(
+                                e.message ?: "Unable to load customer accounts"
+                            )
+                        }
+                    }
                 }
 
                 LaunchedEffect(Unit) {
-                    if (!hasPermissions) {
-                        permissionLauncher.launch(requiredPermissions)
-                    }
+                    loadKhata()
                 }
 
+                // ── Navigation state ──────────────────────────────────────────
                 var currentDestination by remember { mutableStateOf(VaadaDestination.Assistant) }
 
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    Scaffold(
-                        bottomBar = {
-                            VaadaBottomBar(
-                                currentDestination = currentDestination,
-                                onNavigate = { currentDestination = it }
+                // ── Voice auth: auto-proceed when verified ────────────────────
+                LaunchedEffect(voiceAuthSession, authState) {
+                    if (authState is AuthState.VoiceVerify &&
+                        voiceAuthSession is VoiceAuthSession.Verified
+                    ) {
+                        // Brief pause so the user sees the green checkmark
+                        kotlinx.coroutines.delay(1200)
+                        authState = AuthState.Authenticated
+                    }
+                }
+
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+
+                    when (authState) {
+                        // ── Auth screens ───────────────────────────────────────────
+                        is AuthState.Unauthenticated -> {
+                            WelcomeScreen(
+                                onLoginClick = { authState = AuthState.PhoneEntry() },
+                                onSignupClick = { authState = AuthState.SignupEntry(phone = "") }
                             )
                         }
-                    ) { innerPadding ->
-                        when (currentDestination) {
-                            VaadaDestination.Assistant -> {
-                                HomeScreen(
-                                    state = assistantState,
-                                    hasPermissions = hasPermissions,
-                                    lastMetadata = lastMetadata,
-                                    onStartService = { VaadaAudioService.startService(context) },
-                                    onStopService = { VaadaAudioService.stopService(context) },
-                                    onStartRecording = { VaadaAudioService.startRecording(context) },
-                                    onStopRecording = { VaadaAudioService.stopRecording(context) },
-                                    onRequestPermissions = { permissionLauncher.launch(requiredPermissions) },
-                                    modifier = Modifier.padding(innerPadding)
-                                )
-                            }
-                            VaadaDestination.Ledger -> {
-                                KhataScreen(
-                                    modifier = Modifier.padding(innerPadding)
-                                )
-                            }
-                            VaadaDestination.Settings -> {
-                                SettingsDiagnosticsScreen(
-                                    state = assistantState,
-                                    hasPermissions = hasPermissions,
-                                    detectionCount = detectionCount,
-                                    lastTriggerScore = lastScore,
-                                    threshold = threshold,
-                                    lastEvaluatedScore = lastEvaluatedScore,
-                                    metadata = lastMetadata,
-                                    onStartService = { VaadaAudioService.startService(context) },
-                                    onStopService = { VaadaAudioService.stopService(context) },
-                                    onStopRecording = { VaadaAudioService.stopRecording(context) },
-                                    modifier = Modifier.padding(innerPadding)
-                                )
+
+                        is AuthState.PhoneEntry -> {
+                            val s = authState as AuthState.PhoneEntry
+                            LoginScreen(
+                                phone = s.phone,
+                                onPhoneChange = { authState = s.copy(phone = it, error = null) },
+                                loading = s.loading,
+                                error = s.error,
+                                onSendOtp = {
+                                    // Auth backend not connected — dev bypass: build a placeholder profile
+                                    // and move to voice verification step.
+                                    val profile = MerchantProfile(
+                                        id = "dev",
+                                        merchantName = "Dev User",
+                                        shopName = "श्री किराना स्टोर्स",
+                                        phone = s.phone
+                                    )
+                                    merchantProfile = profile
+                                    // Reset any stale voice auth session for this account before starting
+                                    VaadaAudioService.resetVoiceAuth()
+                                    authState = AuthState.VoiceVerify(profile)
+                                },
+                                onBack = { authState = AuthState.Unauthenticated }
+                            )
+                        }
+
+                        is AuthState.OtpEntry -> {
+                            val s = authState as AuthState.OtpEntry
+                            OtpScreen(
+                                phone = s.phone,
+                                otp = s.otp,
+                                onOtpChange = { authState = s.copy(otp = it, error = null) },
+                                loading = s.loading,
+                                error = s.error,
+                                onVerify = {
+                                    val profile = MerchantProfile(
+                                        id = "dev",
+                                        merchantName = "Dev User",
+                                        shopName = "श्री किराना स्टोर्स",
+                                        phone = s.phone
+                                    )
+                                    merchantProfile = profile
+                                    VaadaAudioService.resetVoiceAuth()
+                                    authState = AuthState.VoiceVerify(profile)
+                                },
+                                onResend = { /* no-op until auth backend is connected */ },
+                                onBack = { authState = AuthState.PhoneEntry(phone = s.phone) }
+                            )
+                        }
+
+                        is AuthState.SignupEntry -> {
+                            val s = authState as AuthState.SignupEntry
+                            SignupScreen(
+                                phone = s.phone,
+                                merchantName = s.merchantName,
+                                shopName = s.shopName,
+                                onMerchantNameChange = { authState = s.copy(merchantName = it, error = null) },
+                                onShopNameChange = { authState = s.copy(shopName = it, error = null) },
+                                loading = s.loading,
+                                error = s.error,
+                                onSubmit = {
+                                    val profile = MerchantProfile(
+                                        id = "dev",
+                                        merchantName = s.merchantName.ifBlank { "Dev User" },
+                                        shopName = s.shopName.ifBlank { "My Shop" },
+                                        phone = s.phone
+                                    )
+                                    merchantProfile = profile
+                                    VaadaAudioService.resetVoiceAuth()
+                                    authState = AuthState.VoiceVerify(profile)
+                                },
+                                onBack = { authState = AuthState.Unauthenticated }
+                            )
+                        }
+
+                        // ── Voice Verification screen ──────────────────────────────
+                        is AuthState.VoiceVerify -> {
+                            val s = authState as AuthState.VoiceVerify
+
+                            VoiceVerifyScreen(
+                                profile = s.profile,
+                                voiceAuthSession = voiceAuthSession,
+                                isRecording = isVerifyRecording,
+                                amplitudeRms = verifyAmplitudeRms,
+                                onStartRecording = {
+                                    if (!hasPermissions) {
+                                        permissionLauncher.launch(requiredPermissions)
+                                        return@VoiceVerifyScreen
+                                    }
+                                    // Guard: service must NOT be running so wake-word doesn't conflict
+                                    // If service is running, we still use a separate AudioRecord
+                                    // by launching our own capture below.
+                                    if (isVerifyRecording) return@VoiceVerifyScreen
+                                    isVerifyRecording = true
+                                    verifyAmplitudeRms = 0f
+                                    scope.launch {
+                                        captureAndVerify(
+                                            context = context,
+                                            profile = s.profile,
+                                            onAmplitude = { verifyAmplitudeRms = it },
+                                            onDone = { isVerifyRecording = false }
+                                        )
+                                    }
+                                },
+                                onStopRecording = {
+                                    // User manually stopped early — handled inside captureAndVerify
+                                    isVerifyRecording = false
+                                },
+                                onProceedAnyway = {
+                                    // Only when voice auth is Unavailable — proceed to dashboard
+                                    authState = AuthState.Authenticated
+                                },
+                                onLogout = {
+                                    // Clear session and go back to Welcome
+                                    val currentSession = voiceAuthSession
+                                    if (currentSession is VoiceAuthSession.Verified) {
+                                        scope.launch {
+                                            // Fire-and-forget logout; non-fatal
+                                            try {
+                                                com.vaada.network.VoiceAuthClient()
+                                                    .logout(currentSession.token)
+                                            } catch (_: Exception) {}
+                                        }
+                                    }
+                                    VaadaAudioService.resetVoiceAuth()
+                                    merchantProfile = null
+                                    authState = AuthState.Unauthenticated
+                                }
+                            )
+                        }
+
+                        // ── Main app (authenticated) ───────────────────────────────
+                        is AuthState.Authenticated -> {
+                            Scaffold(
+                                bottomBar = {
+                                    VaadaBottomBar(
+                                        currentDestination = currentDestination,
+                                        onNavigate = {
+                                            currentDestination = it
+                                            if (it == VaadaDestination.Ledger) {
+                                                loadKhata()
+                                            }
+                                        }
+                                    )
+                                }
+                            ) { innerPadding ->
+                                when (currentDestination) {
+                                    VaadaDestination.Assistant -> {
+                                        HomeScreen(
+                                            state = assistantState,
+                                            hasPermissions = hasPermissions,
+                                            lastMetadata = lastMetadata,
+                                            shopName = merchantProfile?.shopName ?: "आपकी दुकान",
+                                            onStartService = { VaadaAudioService.startService(context) },
+                                            onStopService  = { VaadaAudioService.stopService(context) },
+                                            onStartRecording = { VaadaAudioService.startRecording(context) },
+                                            onStopRecording  = { VaadaAudioService.stopRecording(context) },
+                                            onRequestPermissions = { permissionLauncher.launch(requiredPermissions) },
+                                            modifier = Modifier.padding(innerPadding)
+                                        )
+                                    }
+
+                                    VaadaDestination.Ledger -> {
+                                        KhataScreen(
+                                            uiState  = khataState,
+                                            onRetry  = { loadKhata() },
+                                            modifier = Modifier.padding(innerPadding)
+                                        )
+                                    }
+
+                                    VaadaDestination.Settings -> {
+                                        SettingsScreen(
+                                            state              = assistantState,
+                                            hasPermissions     = hasPermissions,
+                                            detectionCount     = detectionCount,
+                                            lastTriggerScore   = lastScore,
+                                            threshold          = threshold,
+                                            lastEvaluatedScore = lastEvaluatedScore,
+                                            metadata           = lastMetadata,
+                                            onStartService     = { VaadaAudioService.startService(context) },
+                                            onStopService      = { VaadaAudioService.stopService(context) },
+                                            onStopRecording    = { VaadaAudioService.stopRecording(context) },
+                                            merchantName       = merchantProfile?.merchantName ?: "",
+                                            shopName           = merchantProfile?.shopName ?: "",
+                                            phone              = merchantProfile?.phone ?: "",
+                                            onLogout           = {
+                                                // Server-side logout of voice auth session
+                                                val currentSession = voiceAuthSession
+                                                if (currentSession is VoiceAuthSession.Verified) {
+                                                    scope.launch {
+                                                        try {
+                                                            com.vaada.network.VoiceAuthClient()
+                                                                .logout(currentSession.token)
+                                                        } catch (_: Exception) {}
+                                                    }
+                                                }
+                                                VaadaAudioService.resetVoiceAuth()
+                                                merchantProfile = null
+                                                authState = AuthState.Unauthenticated
+                                            },
+                                            modifier = Modifier.padding(innerPadding)
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -165,318 +353,184 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-}
 
-@Composable
-private fun SettingsDiagnosticsScreen(
-    state: AssistantState,
-    hasPermissions: Boolean,
-    detectionCount: Int,
-    lastTriggerScore: Float,
-    threshold: Float,
-    lastEvaluatedScore: Float,
-    metadata: AudioCaptureMetadata?,
-    onStartService: () -> Unit,
-    onStopService: () -> Unit,
-    onStopRecording: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val scrollState = rememberScrollState()
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(scrollState)
-            .padding(20.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "Engine Diagnostics & Settings",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                color = KiranaGreenPrimary
-            )
-        }
-        Spacer(modifier = Modifier.height(6.dp))
-        Text(
-            text = "Technical telemetry, threshold calibration and hardware handoff profiling moved here to keep the Home screen clean.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = KiranaTextSecondary
-        )
-        Spacer(modifier = Modifier.height(16.dp))
+    /**
+     * Capture audio for voice verification using a dedicated AudioRecord instance.
+     * This is separate from VaadaAudioService's AudioCaptureManager so it does NOT
+     * conflict with wake-word detection (which runs in the service).
+     *
+     * Records up to 6 seconds, targeting ≥ 2 s of active speech as required by
+     * docs/voice_auth.md (verify_min_total_s=1.5, verify_min_speech_s=1.2).
+     */
+    @Suppress("MissingPermission")
+    private suspend fun captureAndVerify(
+        context: android.content.Context,
+        profile: MerchantProfile,
+        onAmplitude: (Float) -> Unit,
+        onDone: () -> Unit
+    ) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val TAG = "VoiceVerifyCapture"
+        android.util.Log.i(TAG, "Starting voice capture for verification. accountId=${profile.id}")
 
-        AssistantStatusCard(
-            state = state,
-            hasPermissions = hasPermissions,
-            detectionCount = detectionCount,
-            lastTriggerScore = lastTriggerScore,
-            threshold = threshold,
-            lastEvaluatedScore = lastEvaluatedScore,
-            onStartService = onStartService,
-            onStopService = onStopService,
-            onStopRecording = onStopRecording
-        )
+        val sampleRate = 16000
+        val channelConfig = android.media.AudioFormat.CHANNEL_IN_MONO
+        val audioFormat = android.media.AudioFormat.ENCODING_PCM_16BIT
+        val minBuf = android.media.AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+        val bufSize = maxOf(minBuf * 2, 4096)
 
-        Spacer(modifier = Modifier.height(16.dp))
-
-        AudioInspectorCard(metadata = metadata)
-    }
-}
-
-@Composable
-private fun StagePlaceholderScreen(
-    title: String,
-    subtitle: String,
-    modifier: Modifier = Modifier
-) {
-    Box(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.headlineSmall,
-                color = KiranaGreenPrimary,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodyMedium,
-                color = KiranaTextSecondary
-            )
-        }
-    }
-}
-
-
-
-@Composable
-private fun AssistantStatusCard(
-    state: AssistantState,
-    hasPermissions: Boolean,
-    detectionCount: Int,
-    lastTriggerScore: Float,
-    threshold: Float,
-    lastEvaluatedScore: Float,
-    onStartService: () -> Unit,
-    onStopService: () -> Unit,
-    onStopRecording: () -> Unit
-) {
-    val statusColor by animateColorAsState(
-        targetValue = when (state) {
-            is AssistantState.Stopped -> Color(0xFF757575)
-            is AssistantState.Standby -> Color(0xFF1976D2)
-            is AssistantState.Listening -> Color(0xFF2E7D32)
-            is AssistantState.Captured -> Color(0xFF7B1FA2)
-            is AssistantState.Error -> Color(0xFFC62828)
-        },
-        label = "statusColor"
-    )
-
-    val statusBadgeText = when (state) {
-        is AssistantState.Stopped -> "OFFLINE"
-        is AssistantState.Standby -> "STANDBY"
-        is AssistantState.Listening -> "LISTENING"
-        is AssistantState.Captured -> "CAPTURED"
-        is AssistantState.Error -> "ERROR"
-    }
-
-    val statusDescription = when (state) {
-        is AssistantState.Stopped -> "Service Inactive. Tap Start to activate local wake-word listener."
-        is AssistantState.Standby -> "Listening for wake word \"Hey Jarvis\" (or tap Push-to-Talk)."
-        is AssistantState.Listening -> "Recording merchant command... (Speak now; auto-stops on silence)."
-        is AssistantState.Captured -> "Command recorded & verified! Resuming standby listener..."
-        is AssistantState.Error -> "Error: ${state.message}"
-    }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text(
-                        text = "VOICE ENGINE & FOREGROUND SERVICE",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.outline
+        val recorder = try {
+            android.media.AudioRecord(
+                android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                sampleRate, channelConfig, audioFormat, bufSize
+            ).also {
+                if (it.state != android.media.AudioRecord.STATE_INITIALIZED) {
+                    android.util.Log.e(TAG, "AudioRecord init failed")
+                    VaadaAudioService.setVoiceAuthSession(
+                        com.vaada.models.VoiceAuthSession.NetworkError("Microphone init failed")
                     )
-                    Text(
-                        text = "Wake Phrase: \"Hey Jarvis\"",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    onDone()
+                    return@withContext
                 }
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(statusColor.copy(alpha = 0.15f))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                ) {
-                    Text(
-                        text = statusBadgeText,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = statusColor
-                    )
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "AudioRecord creation failed", e)
+            VaadaAudioService.setVoiceAuthSession(
+                com.vaada.models.VoiceAuthSession.NetworkError("Mic unavailable: ${e.message}")
+            )
+            onDone()
+            return@withContext
+        }
+
+        try {
+            recorder.startRecording()
+            val byteStream = java.io.ByteArrayOutputStream()
+            val buffer = ShortArray(bufSize / 2)
+            val maxMs = 6000L
+            val startMs = System.currentTimeMillis()
+
+            while (System.currentTimeMillis() - startMs < maxMs) {
+                val read = recorder.read(buffer, 0, buffer.size)
+                if (read <= 0) break
+                // Amplitude feedback
+                val rms = (buffer.take(read).map { it.toLong() * it.toLong() }
+                    .average().let { kotlin.math.sqrt(it) } / 32767.0).toFloat()
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    onAmplitude(rms)
+                }
+                // Convert shorts to bytes and accumulate
+                for (i in 0 until read) {
+                    byteStream.write(buffer[i].toInt() and 0xFF)
+                    byteStream.write((buffer[i].toInt() shr 8) and 0xFF)
                 }
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            recorder.stop()
+            val pcmBytes = byteStream.toByteArray()
+            android.util.Log.i(TAG, "Captured ${pcmBytes.size} PCM bytes for voice verify")
 
-            Text(
-                text = statusDescription,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            // Convert PCM → WAV
+            val wavFile = File(context.cacheDir, "voice_verify_${System.currentTimeMillis()}.wav")
+            writePcmToWav(pcmBytes, wavFile)
 
-            // Live RMS Audio Level Bar when Listening
-            if (state is AssistantState.Listening) {
-                Spacer(modifier = Modifier.height(12.dp))
-                val animatedRms by animateFloatAsState(
-                    targetValue = state.amplitudeRms,
-                    label = "rmsProgress"
+            android.util.Log.i(TAG, "WAV ready: ${wavFile.length()} bytes → uploading to /v1/auth/verify")
+
+            // Send to service for verification (service has VoiceAuthClient)
+            // We bind to service instance, but since the service may not be started,
+            // we directly call a suspend function through a service instance.
+            // Architecture note: use a local instance of VoiceAuthClient here since
+            // VaadaAudioService may not be running during the auth phase.
+            val client = com.vaada.network.VoiceAuthClient()
+            VaadaAudioService.setVoiceAuthSession(com.vaada.models.VoiceAuthSession.Verifying)
+            try {
+                val result = client.verify(
+                    accountId = profile.id,
+                    sessionId = "verify-${profile.id}", // separate from voice-turn session
+                    wavFile = wavFile
                 )
-                Text(
-                    text = "Live Mic Level (RMS):",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.outline
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                LinearProgressIndicator(
-                    progress = { animatedRms.coerceIn(0f, 1f) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(8.dp)
-                        .clip(RoundedCornerShape(4.dp)),
-                    color = Color(0xFF2E7D32)
-                )
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // Wake-Word Telemetry
-            InspectorRow(label = "Detection Threshold", value = String.format("%.2f", threshold))
-            InspectorRow(
-                label = "Live / Last Score",
-                value = if (lastEvaluatedScore > 0f) String.format("%.4f", lastEvaluatedScore) else "0.0000"
-            )
-            InspectorRow(
-                label = "Last Trigger Score",
-                value = if (lastTriggerScore > 0f) String.format("%.4f", lastTriggerScore) else "None"
-            )
-            InspectorRow(label = "Wake Word Triggers", value = "$detectionCount")
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                if (state is AssistantState.Stopped) {
-                    Button(
-                        onClick = onStartService,
-                        enabled = hasPermissions,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text("Start Assistant Service")
+                android.util.Log.i(TAG, "verify result: status=${result.status} reason=${result.reason}")
+                val newSession: com.vaada.models.VoiceAuthSession = when (result.status) {
+                    "verified" -> {
+                        val token = result.authToken
+                        if (token != null) {
+                            val expiresAt = System.currentTimeMillis() + ((result.expiresInS ?: 300) * 1000L)
+                            com.vaada.models.VoiceAuthSession.Verified(
+                                accountId = profile.id,
+                                sessionId = "verify-${profile.id}",
+                                token = token,
+                                expiresAtMs = expiresAt
+                            )
+                        } else {
+                            com.vaada.models.VoiceAuthSession.NetworkError("Server verified but returned no auth_token")
+                        }
                     }
-                } else if (state is AssistantState.Listening) {
-                    Button(
-                        onClick = onStopRecording,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(10.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
-                    ) {
-                        Text("⏹  Finish Utterance Now")
+                    "inconclusive" -> com.vaada.models.VoiceAuthSession.Inconclusive(result.reason)
+                    "rejected" -> when (result.reason) {
+                        "locked" -> com.vaada.models.VoiceAuthSession.Locked(
+                            retryAfterMs = System.currentTimeMillis() + ((result.retryAfterS ?: 300) * 1000L)
+                        )
+                        "not_enrolled" -> com.vaada.models.VoiceAuthSession.NotEnrolled(accountId = profile.id)
+                        else -> com.vaada.models.VoiceAuthSession.Rejected(reason = result.reason)
                     }
-                } else {
-                    OutlinedButton(
-                        onClick = onStopService,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text("Stop Assistant (Explicit)")
-                    }
+                    "unavailable" -> com.vaada.models.VoiceAuthSession.Unavailable(result.reason)
+                    else -> com.vaada.models.VoiceAuthSession.NetworkError("Unknown status: ${result.status}")
                 }
-            }
-        }
-    }
-}
-
-
-
-@Composable
-private fun AudioInspectorCard(metadata: AudioCaptureMetadata?) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = "CAPTURED UTTERANCE INSPECTOR",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.outline
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-
-            if (metadata == null) {
-                Text(
-                    text = "No command recorded yet. Start the assistant and say \"Hey Jarvis\" or tap Push-to-Talk.",
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                VaadaAudioService.setVoiceAuthSession(newSession)
+            } catch (e: java.io.IOException) {
+                android.util.Log.e(TAG, "verify network error", e)
+                VaadaAudioService.setVoiceAuthSession(
+                    com.vaada.models.VoiceAuthSession.NetworkError(e.message ?: "Network error")
                 )
-            } else {
-                InspectorRow(label = "Format", value = "${metadata.sampleRate} Hz, Mono (${metadata.audioFormat})")
-                InspectorRow(label = "Duration", value = "${metadata.durationMs} ms (${String.format("%.2f", metadata.durationMs / 1000f)} sec)")
-                InspectorRow(label = "Total Size", value = "${metadata.totalBytes} bytes (${metadata.totalBytes / 1024} KB)")
-                InspectorRow(label = "Max Amplitude", value = "${metadata.maxAmplitude} / 32767")
-                InspectorRow(label = "Average RMS", value = String.format("%.4f", metadata.averageRms))
-                InspectorRow(label = "Storage Path", value = "cache/last_utterance.pcm")
+            } finally {
+                try { wavFile.delete() } catch (_: Exception) {}
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "captureAndVerify error", e)
+            VaadaAudioService.setVoiceAuthSession(
+                com.vaada.models.VoiceAuthSession.NetworkError(e.message ?: "Capture error")
+            )
+        } finally {
+            try { recorder.release() } catch (_: Exception) {}
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                onDone()
             }
         }
     }
-}
 
-@Composable
-private fun InspectorRow(label: String, value: String) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 3.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(
-            text = label,
-            fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.outline
+    /**
+     * Write PCM bytes to a valid WAV file (PCM16, mono, 16 kHz).
+     * Same algorithm as VaadaAudioService.pcmToWav — duplicated here because
+     * this runs in MainActivity context (outside the service).
+     */
+    private fun writePcmToWav(pcmBytes: ByteArray, wavFile: File) {
+        val sampleRate = 16000
+        val channels: Short = 1
+        val bitsPerSample: Short = 16
+        val byteRate = sampleRate * channels * (bitsPerSample / 8)
+        val blockAlign = (channels * (bitsPerSample / 8)).toShort()
+        val dataLen = pcmBytes.size
+        val chunkSize = 36 + dataLen
+        fun Int.le4(): ByteArray = byteArrayOf(
+            (this and 0xFF).toByte(), ((this shr 8) and 0xFF).toByte(),
+            ((this shr 16) and 0xFF).toByte(), ((this shr 24) and 0xFF).toByte()
         )
-        Text(
-            text = value,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            fontFamily = FontFamily.Monospace,
-            color = MaterialTheme.colorScheme.onSurface
+        fun Short.le2(): ByteArray = byteArrayOf(
+            (this.toInt() and 0xFF).toByte(), ((this.toInt() shr 8) and 0xFF).toByte()
         )
+        FileOutputStream(wavFile).use { out ->
+            out.write("RIFF".toByteArray(Charsets.US_ASCII))
+            out.write(chunkSize.le4())
+            out.write("WAVE".toByteArray(Charsets.US_ASCII))
+            out.write("fmt ".toByteArray(Charsets.US_ASCII))
+            out.write(16.le4())
+            out.write((1).toShort().le2())
+            out.write(channels.le2())
+            out.write(sampleRate.le4())
+            out.write(byteRate.le4())
+            out.write(blockAlign.le2())
+            out.write(bitsPerSample.le2())
+            out.write("data".toByteArray(Charsets.US_ASCII))
+            out.write(dataLen.le4())
+            out.write(pcmBytes)
+        }
     }
 }

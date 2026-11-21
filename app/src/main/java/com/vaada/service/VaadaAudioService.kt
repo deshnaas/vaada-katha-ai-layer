@@ -7,12 +7,16 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.media.MediaPlayer
+import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.suxsem.androidwakeword.WakeWordDetector
 import com.vaada.audio.AudioCaptureManager
+import com.vaada.network.VoiceAuthClient
 import com.vaada.network.VoiceGatewayClient
+import com.vaada.models.VoiceAuthSession
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -28,6 +32,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import java.util.concurrent.atomic.AtomicBoolean
 
 class VaadaAudioService : Service() {
@@ -66,6 +74,23 @@ class VaadaAudioService : Service() {
         val peakScore: StateFlow<Float> = _peakScore.asStateFlow()
 
         private var peakDecayJob: Job? = null
+
+        // ── Voice Auth Session (in-memory, never persisted) ─────────────────
+        private val _voiceAuthSession = MutableStateFlow<VoiceAuthSession>(VoiceAuthSession.None)
+        val voiceAuthSession: StateFlow<VoiceAuthSession> = _voiceAuthSession.asStateFlow()
+
+        /**
+         * Reset voice auth session. MUST be called on logout or account switch
+         * so one merchant's session is never reused for another.
+         */
+        fun resetVoiceAuth() {
+            _voiceAuthSession.value = VoiceAuthSession.None
+        }
+
+        /** Update voice auth session (called from MainActivity after verify/logout). */
+        fun setVoiceAuthSession(session: VoiceAuthSession) {
+            _voiceAuthSession.value = session
+        }
 
         fun startService(context: Context) {
             val intent = Intent(context, VaadaAudioService::class.java).apply {
@@ -106,6 +131,7 @@ class VaadaAudioService : Service() {
 
     // Voice Gateway
     private val voiceGatewayClient = VoiceGatewayClient()
+    private val voiceAuthClient = VoiceAuthClient()
     private val sessionId: String = UUID.randomUUID().toString()
 
     // Concurrency & Handoff guards
@@ -134,7 +160,6 @@ class VaadaAudioService : Service() {
                 updateNotification(isRecording = false)
 
                 // ── Gateway upload ──────────────────────────────────────────
-                // AudioRecord is already released by AudioCaptureManager before this callback fires.
                 val clientMsgId = UUID.randomUUID().toString()
                 serviceScope.launch(Dispatchers.IO) {
                     try {
@@ -143,6 +168,9 @@ class VaadaAudioService : Service() {
                             resumeWakeWordStandbyAfterCapture()
                             return@launch
                         }
+                        // Show processing state while network call is in flight
+                        _assistantState.value = AssistantState.Processing
+
                         val wavFile = File(cacheDir, "last_utterance.wav")
                         pcmToWav(pcmFile, wavFile)
 
@@ -160,9 +188,33 @@ class VaadaAudioService : Service() {
                             "| duplicate=${result.duplicate}"
                         )
                         if (result.ledgerCommitted) {
-                            Log.i(TAG, "LEDGER COMMITTED – transaction saved by gateway (txId=${result.ledgerTransactionId})")
+                            Log.i(TAG, "LEDGER COMMITTED – transaction saved (txId=${result.ledgerTransactionId})")
                         }
-                        // TTS will be added in a future task; speak is logged only for now.
+                        // Transition to Responding state so the UI can display reply
+                        _assistantState.value = AssistantState.Responding(
+                            transcript      = result.transcript,
+                            replyText       = result.replyText,
+                            replyKind       = result.replyKind,
+                            dialogueState   = result.dialogueState,
+                            ledgerCommitted = result.ledgerCommitted,
+                            duplicate       = result.duplicate
+                        )
+                        // Do not replay duplicate replies. Keep wake-word paused while audio plays.
+                        if (!result.duplicate && !result.audioBase64.isNullOrBlank()) {
+                            try {
+                                playGatewayAudio(result.audioBase64)
+                            } catch (playbackError: Exception) {
+                                Log.e(TAG, "Could not play gateway audio", playbackError)
+                            }
+                        } else {
+                            Log.i(TAG, "No playable gateway audio; status=${result.audioStatus}, duplicate=${result.duplicate}")
+                        }
+                    } catch (e: com.vaada.network.VoiceGatewayException) {
+                        Log.e(TAG, "Gateway error [${e.errorCode}]: ${e.message}")
+                        _assistantState.value = AssistantState.Error("Gateway: ${e.message}")
+                    } catch (e: java.io.IOException) {
+                        Log.e(TAG, "Network IO error contacting gateway", e)
+                        _assistantState.value = AssistantState.Error("Network error – check connection")
                     } catch (e: Exception) {
                         Log.e(TAG, "Unexpected error during gateway upload", e)
                         _assistantState.value = AssistantState.Error("Unexpected error: ${e.message}")
@@ -206,6 +258,60 @@ class VaadaAudioService : Service() {
         return START_STICKY
     }
 
+    /** Decode and play the WAV returned by the voice gateway. This suspends until playback ends. */
+    private suspend fun playGatewayAudio(encodedAudio: String) {
+        val audioFile = withContext(Dispatchers.IO) {
+            val bytes = Base64.decode(encodedAudio, Base64.DEFAULT)
+            require(bytes.isNotEmpty()) { "Gateway returned empty audio" }
+            File(cacheDir, "gateway_reply.wav").apply { writeBytes(bytes) }
+        }
+
+        Log.i(TAG, "Playing Gnani audio: ${audioFile.length()} bytes")
+
+        withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine<Unit> { continuation ->
+                val player = MediaPlayer()
+                var released = false
+
+                fun releasePlayer() {
+                    if (!released) {
+                        released = true
+                        try { player.release() } catch (_: Exception) { }
+                    }
+                }
+
+                continuation.invokeOnCancellation { releasePlayer() }
+
+                try {
+                    player.setDataSource(audioFile.absolutePath)
+                    player.setOnCompletionListener {
+                        Log.i(TAG, "Gnani audio playback completed")
+                        releasePlayer()
+                        if (continuation.isActive) continuation.resume(Unit)
+                    }
+                    player.setOnErrorListener { _, what, extra ->
+                        Log.e(TAG, "Gnani audio playback error: what=$what extra=$extra")
+                        releasePlayer()
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(
+                                IllegalStateException("Gateway audio playback failed ($what/$extra)")
+                            )
+                        }
+                        true
+                    }
+                    player.setOnPreparedListener {
+                        Log.i(TAG, "Gnani audio playback started")
+                        it.start()
+                    }
+                    player.prepareAsync()
+                } catch (e: Exception) {
+                    releasePlayer()
+                    if (continuation.isActive) continuation.resumeWithException(e)
+                }
+            }
+        }
+    }
+
     // ── PCM → WAV conversion ───────────────────────────────────────────────────
     private fun pcmToWav(pcmFile: File, wavFile: File) {
         val pcmBytes = pcmFile.readBytes()
@@ -240,6 +346,77 @@ class VaadaAudioService : Service() {
             out.write(pcmBytes)
         }
         Log.d(TAG, "PCM→WAV: ${pcmFile.length()} PCM bytes → ${wavFile.length()} WAV bytes")
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Verify speaker voice against the enrolled voiceprint.
+     * Called from MainActivity after capturing a voice sample for auth (not for voice turns).
+     *
+     * This is a coroutine-compatible call: it must be launched from a coroutine scope.
+     * Updates [voiceAuthSession] state directly on the companion StateFlow.
+     *
+     * Microphone ownership: caller must ensure wake-word service is NOT capturing audio
+     * before calling this. The [wavFile] is a WAV already converted from PCM.
+     *
+     * @param accountId  The merchant's account id (ledger customer id).
+     * @param sessionId  The session id that will be used for voice turns too.
+     * @param wavFile    A valid WAV (PCM16 mono 16 kHz, 1.5–30 s).
+     */
+    suspend fun verifyVoice(accountId: String, sessionId: String, wavFile: File) {
+        Log.i(TAG, "verifyVoice: accountId=$accountId sessionId=$sessionId wavBytes=${wavFile.length()}")
+        setVoiceAuthSession(VoiceAuthSession.Verifying)
+        try {
+            val result = voiceAuthClient.verify(accountId, sessionId, wavFile)
+            Log.i(TAG, "verifyVoice result: status=${result.status} reason=${result.reason}")
+            val newSession = when (result.status) {
+                "verified" -> {
+                    val token = result.authToken ?: run {
+                        Log.e(TAG, "verified but no auth_token in response — treating as network error")
+                        VoiceAuthSession.NetworkError("Server returned verified but no auth_token")
+                    }
+                    if (token is String) {
+                        val expiresAt = System.currentTimeMillis() + ((result.expiresInS ?: 300) * 1000L)
+                        VoiceAuthSession.Verified(accountId = accountId, sessionId = sessionId, token = token, expiresAtMs = expiresAt)
+                    } else token as VoiceAuthSession
+                }
+                "inconclusive" -> VoiceAuthSession.Inconclusive(result.reason)
+                "rejected" -> {
+                    if (result.reason == "locked") {
+                        val unlockAt = System.currentTimeMillis() + ((result.retryAfterS ?: 300) * 1000L)
+                        VoiceAuthSession.Locked(retryAfterMs = unlockAt)
+                    } else if (result.reason == "not_enrolled") {
+                        VoiceAuthSession.NotEnrolled(accountId = accountId)
+                    } else {
+                        VoiceAuthSession.Rejected(reason = result.reason)
+                    }
+                }
+                "unavailable" -> VoiceAuthSession.Unavailable(result.reason)
+                else -> VoiceAuthSession.NetworkError("Unknown status: ${result.status}")
+            }
+            setVoiceAuthSession(newSession)
+        } catch (e: java.io.IOException) {
+            Log.e(TAG, "verifyVoice network error", e)
+            setVoiceAuthSession(VoiceAuthSession.NetworkError(e.message ?: "Network error"))
+        } catch (e: Exception) {
+            Log.e(TAG, "verifyVoice unexpected error", e)
+            setVoiceAuthSession(VoiceAuthSession.NetworkError(e.message ?: "Unexpected error"))
+        }
+    }
+
+    /**
+     * Server-side logout: invalidate the current auth token.
+     * Non-fatal. Must be called on user logout and account switch.
+     */
+    suspend fun logoutVoiceAuth(token: String) {
+        try {
+            voiceAuthClient.logout(token)
+            Log.i(TAG, "logoutVoiceAuth: server-side session invalidated")
+        } catch (e: Exception) {
+            Log.w(TAG, "logoutVoiceAuth: non-fatal error", e)
+        } finally {
+            setVoiceAuthSession(VoiceAuthSession.None)
+        }
     }
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -467,7 +644,7 @@ class VaadaAudioService : Service() {
     private fun acquireWakeLock() {
         try {
             if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire(600000L) // 10 min timeout
+                wakeLock?.acquire() // 10 min timeout
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to acquire WakeLock", e)

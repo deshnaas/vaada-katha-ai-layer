@@ -1,4 +1,3 @@
-
 package com.vaada.network
 
 import kotlinx.coroutines.Dispatchers
@@ -26,7 +25,9 @@ data class VoiceTurnResult(
     val ledgerCommitted: Boolean,
     val ledgerTransactionId: Int?,
     val ledgerBalancePaise: Long?,
-    val duplicate: Boolean
+    val duplicate: Boolean,
+    val audioStatus: String,
+    val audioBase64: String?
 )
 
 class VoiceGatewayException(
@@ -36,7 +37,7 @@ class VoiceGatewayException(
 ) : IOException(message)
 
 class VoiceGatewayClient(
-    private val baseUrl: String = "http://10.115.28.147:8100"
+    private val baseUrl: String = "http://10.115.28.169:8100"
 ) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -50,38 +51,26 @@ class VoiceGatewayClient(
         clientMsgId: String = UUID.randomUUID().toString(),
         language: String = "hi-IN,en-IN"
     ): VoiceTurnResult = withContext(Dispatchers.IO) {
-
         require(sessionId.matches(Regex("[A-Za-z0-9_-]{1,64}"))) {
             "Invalid session ID"
         }
-
         require(clientMsgId.matches(Regex("[A-Za-z0-9_:.\\-]{1,100}"))) {
             "Invalid client message ID"
         }
-
         require(audioFile.exists() && audioFile.isFile) {
             "Audio file does not exist"
         }
-
         require(audioFile.extension.equals("wav", ignoreCase = true)) {
             "Gateway requires a WAV audio file"
         }
-
         require(audioFile.length() in 101..(5L * 1024 * 1024)) {
             "Audio file must be between 101 bytes and 5 MB"
         }
 
-        val audioBody = audioFile.asRequestBody(
-            "audio/wav".toMediaType()
-        )
-
+        val audioBody = audioFile.asRequestBody("audio/wav".toMediaType())
         val multipartBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart(
-                "audio",
-                audioFile.name,
-                audioBody
-            )
+            .addFormDataPart("audio", audioFile.name, audioBody)
             .addFormDataPart("session_id", sessionId)
             .addFormDataPart("client_msg_id", clientMsgId)
             .addFormDataPart("language", language)
@@ -93,7 +82,6 @@ class VoiceGatewayClient(
             .build()
 
         client.newCall(request).execute().use { response ->
-
             val responseText = response.body?.string()
                 ?: throw IOException("Gateway returned an empty response")
 
@@ -106,8 +94,7 @@ class VoiceGatewayClient(
             if (!response.isSuccessful) {
                 val error = json.optJSONObject("error")
                 throw VoiceGatewayException(
-                    errorCode = error?.optString("code", "HTTP_ERROR")
-                        ?: "HTTP_ERROR",
+                    errorCode = error?.optString("code", "HTTP_ERROR") ?: "HTTP_ERROR",
                     message = error?.optString("message", "Gateway request failed")
                         ?: "Gateway request failed",
                     recoverable = error?.optBoolean("recoverable", false) ?: false
@@ -118,13 +105,18 @@ class VoiceGatewayClient(
             val reply = json.optJSONObject("reply")
             val dialogue = json.optJSONObject("dialogue")
             val ledger = json.optJSONObject("ledger")
+            val audio = json.optJSONObject("audio")
+
+            val audioStatus = audio?.optString("status", "unavailable") ?: "unavailable"
+            val audioBase64 = audio?.optString("data")
+                ?.takeIf { it.isNotBlank() && it != "null" }
 
             val speakList = mutableListOf<String>()
             val speakArray = reply?.optJSONArray("speak")
-
             if (speakArray != null) {
                 for (i in 0 until speakArray.length()) {
-                    speakList.add(speakArray.optString(i))
+                    val item = speakArray.optString(i)
+                    if (item.isNotBlank() && item != "null") speakList.add(item)
                 }
             }
 
@@ -138,13 +130,15 @@ class VoiceGatewayClient(
                 dialogueState = dialogue?.optString("state"),
                 awaiting = dialogue?.optString("awaiting"),
                 ledgerCommitted = ledger?.optBoolean("committed", false) ?: false,
-                ledgerTransactionId = if (
-                    ledger != null && ledger.has("transaction_id")
-                ) ledger.optInt("transaction_id") else null,
-                ledgerBalancePaise = if (
-                    ledger != null && ledger.has("balance_paise")
-                ) ledger.optLong("balance_paise") else null,
-                duplicate = json.optBoolean("duplicate", false)
+                ledgerTransactionId = if (ledger != null && ledger.has("transaction_id")) {
+                    ledger.optInt("transaction_id")
+                } else null,
+                ledgerBalancePaise = if (ledger != null && ledger.has("balance_paise")) {
+                    ledger.optLong("balance_paise")
+                } else null,
+                duplicate = json.optBoolean("duplicate", false),
+                audioStatus = audioStatus,
+                audioBase64 = audioBase64
             )
         }
     }

@@ -1,67 +1,36 @@
 package com.vaada.ui.assistant
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
+import androidx.compose.animation.*
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vaada.models.AssistantState
 import com.vaada.models.AudioCaptureMetadata
-import com.vaada.ui.theme.KiranaBaakiRed
-import com.vaada.ui.theme.KiranaBorder
-import com.vaada.ui.theme.KiranaCreamBg
-import com.vaada.ui.theme.KiranaGreenDark
-import com.vaada.ui.theme.KiranaGreenLight
-import com.vaada.ui.theme.KiranaGreenPrimary
-import com.vaada.ui.theme.KiranaIcons
-import com.vaada.ui.theme.KiranaJamaGreen
-import com.vaada.ui.theme.KiranaMint
-import com.vaada.ui.theme.KiranaMintPill
-import com.vaada.ui.theme.KiranaSurface
-import com.vaada.ui.theme.KiranaTextMuted
-import com.vaada.ui.theme.KiranaTextPrimary
-import com.vaada.ui.theme.KiranaTextSecondary
+import com.vaada.ui.theme.*
 
 @Composable
 fun HomeScreen(
     state: AssistantState,
     hasPermissions: Boolean,
     lastMetadata: AudioCaptureMetadata?,
+    shopName: String,
     onStartService: () -> Unit,
     onStopService: () -> Unit,
     onStartRecording: () -> Unit,
@@ -73,6 +42,7 @@ fun HomeScreen(
     val isListening = state is AssistantState.Listening
     val isStopped = state is AssistantState.Stopped
     val isStandby = state is AssistantState.Standby
+    val isProcessing = state is AssistantState.Processing
 
     Column(
         modifier = modifier
@@ -87,65 +57,74 @@ fun HomeScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // ── 1. Top Bar: Merchant Greeting & Subtle Engine Status Pill ───
-            MerchantTopBar(state = state)
+            // ── Top bar ───────────────────────────────────────────────────────
+            MerchantTopBar(state = state, shopName = shopName)
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // ── Permission Notice (If not granted) ──────────────────────────
             if (!hasPermissions) {
                 PermissionNoticeCard(onRequestPermissions = onRequestPermissions)
                 Spacer(modifier = Modifier.height(16.dp))
             }
 
-            // ── 2. Friendly Merchant Headline & Status Subtitle ──────────────
+            // ── Headline / status text ────────────────────────────────────────
             Text(
-                text = "नमस्ते! मैं क्या लिखूँ?",
+                text = when (state) {
+                    is AssistantState.Processing -> "समझ रहा हूँ..."
+                    is AssistantState.Responding -> "जवाब तैयार है"
+                    else -> "नमस्ते! मैं क्या लिखूँ?"
+                },
                 style = MaterialTheme.typography.headlineMedium,
                 fontWeight = FontWeight.Bold,
-                color = KiranaTextPrimary
+                color = KiranaTextPrimary,
+                textAlign = TextAlign.Center
             )
             Spacer(modifier = Modifier.height(6.dp))
 
             val statusSubtitle = when (state) {
-                is AssistantState.Stopped -> "सहायक बंद है • नीचे दिए बटन से शुरू करें"
-                is AssistantState.Standby -> "“Hey Jarvis” बोलें या बटन दबाकर कहें"
+                is AssistantState.Stopped   -> "सहायक बंद है • नीचे दिए बटन से शुरू करें"
+                is AssistantState.Standby   -> "\"Hey Jarvis\" बोलें या बटन दबाकर कहें"
                 is AssistantState.Listening -> "सुन रहा हूँ... अपनी बात बोलें"
-                is AssistantState.Captured -> "समझ लिया • खाता अपडेट किया जा रहा है"
-                is AssistantState.Error -> "त्रुटि: ${state.message}"
+                is AssistantState.Captured  -> "रिकॉर्ड हो गया • gateway पर भेज रहा है..."
+                is AssistantState.Processing -> "Gateway से जवाब मिल रहा है..."
+                is AssistantState.Responding -> state.replyText.ifBlank { "जवाब तैयार है" }
+                is AssistantState.Error     -> "त्रुटि: ${state.message}"
             }
 
             Text(
                 text = statusSubtitle,
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (state is AssistantState.Error) KiranaBaakiRed else KiranaTextSecondary
+                color = when (state) {
+                    is AssistantState.Error     -> KiranaBaakiRed
+                    is AssistantState.Responding -> KiranaGreenPrimary
+                    else                        -> KiranaTextSecondary
+                },
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 8.dp)
             )
 
             Spacer(modifier = Modifier.height(28.dp))
 
-            // ── 3. Beautiful Central Voice Orb ──────────────────────────────
+            // ── Voice Orb ─────────────────────────────────────────────────────
             VoiceOrb(
                 state = state,
                 onClick = {
                     when {
                         !hasPermissions -> onRequestPermissions()
-                        isStopped -> onStartService()
-                        isListening -> onStopRecording()
-                        else -> onStartRecording()
+                        isStopped       -> onStartService()
+                        isListening     -> onStopRecording()
+                        else            -> onStartRecording()
                     }
                 }
             )
 
-            Spacer(modifier = Modifier.height(32.dp))
+            Spacer(modifier = Modifier.height(28.dp))
 
-            // ── 4. Elegant Merchant Conversation / Response Card ────────────
-            ConversationCard(
-                state = state,
-                metadata = lastMetadata
-            )
+            // ── Gateway reply card ────────────────────────────────────────────
+            GatewayReplyCard(state = state, metadata = lastMetadata)
         }
 
-        // ── 5. Ergonomic One-Handed Push-to-Talk Action Button ──────────────
+        // ── Push-to-talk button ───────────────────────────────────────────────
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -154,9 +133,10 @@ fun HomeScreen(
         ) {
             val buttonColor by animateColorAsState(
                 targetValue = when {
-                    isListening -> Color(0xFFC62828)
-                    isStopped -> KiranaGreenLight
-                    else -> KiranaGreenPrimary
+                    isListening     -> Color(0xFFC62828)
+                    isStopped       -> KiranaGreenLight
+                    isProcessing    -> KiranaTextMuted
+                    else            -> KiranaGreenPrimary
                 },
                 label = "pttButtonColor"
             )
@@ -165,27 +145,27 @@ fun HomeScreen(
                 onClick = {
                     when {
                         !hasPermissions -> onRequestPermissions()
-                        isListening -> onStopRecording()
-                        isStopped -> onStartService()
-                        else -> onStartRecording()
+                        isListening     -> onStopRecording()
+                        isStopped       -> onStartService()
+                        isProcessing    -> { /* no-op while processing */ }
+                        else            -> onStartRecording()
                     }
                 },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(58.dp),
+                modifier = Modifier.fillMaxWidth().height(58.dp),
                 shape = RoundedCornerShape(29.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = buttonColor),
                 elevation = ButtonDefaults.buttonElevation(defaultElevation = 3.dp, pressedElevation = 1.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center
-                ) {
+                if (isProcessing) {
+                    CircularProgressIndicator(modifier = Modifier.size(22.dp), color = Color.White, strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text("प्रोसेसिंग...", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                } else {
                     Icon(
                         imageVector = when {
                             isListening -> KiranaIcons.Mic
-                            isStopped -> Icons.Default.PlayArrow
-                            else -> KiranaIcons.Mic
+                            isStopped   -> Icons.Default.PlayArrow
+                            else        -> KiranaIcons.Mic
                         },
                         contentDescription = null,
                         tint = Color.White,
@@ -195,8 +175,8 @@ fun HomeScreen(
                     Text(
                         text = when {
                             isListening -> "⏹  बोलना समाप्त करें (Done)"
-                            isStopped -> "सहायक चालू करें (Start Assistant)"
-                            else -> "🎙  दबाकर बोलें (Push to Talk)"
+                            isStopped   -> "सहायक चालू करें (Start)"
+                            else        -> "🎙  दबाकर बोलें (Push to Talk)"
                         },
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold,
@@ -206,9 +186,8 @@ fun HomeScreen(
             }
 
             Spacer(modifier = Modifier.height(8.dp))
-
             Text(
-                text = if (isStandby) "हाथ खाली नहीं हैं? बस “Hey Jarvis” बोलें" else "किराना वॉइस खाता",
+                text = if (isStandby) "हाथ खाली नहीं हैं? बस \"Hey Jarvis\" बोलें" else "किराना वॉइस खाता",
                 fontSize = 12.sp,
                 color = KiranaTextMuted
             )
@@ -216,10 +195,10 @@ fun HomeScreen(
     }
 }
 
-// ── Top Bar with Store Name & Subtle Engine Status ───────────────────────────
+// ── Top bar ───────────────────────────────────────────────────────────────────
 
 @Composable
-private fun MerchantTopBar(state: AssistantState) {
+private fun MerchantTopBar(state: AssistantState, shopName: String) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -228,79 +207,65 @@ private fun MerchantTopBar(state: AssistantState) {
         Column {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
-                    modifier = Modifier
-                        .size(9.dp)
-                        .clip(CircleShape)
-                        .background(KiranaGreenPrimary)
+                    modifier = Modifier.size(9.dp).clip(CircleShape).background(KiranaGreenPrimary)
                 )
                 Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "VAADA KHATA",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.4.sp,
-                    color = KiranaGreenPrimary
-                )
+                Text("VAADA KHATA", fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.4.sp, color = KiranaGreenPrimary)
             }
             Text(
-                text = "श्री किराना स्टोर्स",
+                text = shopName.ifBlank { "आपकी दुकान" },
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
                 color = KiranaTextPrimary
             )
         }
 
-        // Engine Status Pill
-        val isServiceActive = state !is AssistantState.Stopped
-        val statusDotColor = when (state) {
-            is AssistantState.Listening -> KiranaJamaGreen
-            is AssistantState.Standby -> KiranaGreenPrimary
-            is AssistantState.Captured -> KiranaGreenLight
-            is AssistantState.Error -> KiranaBaakiRed
-            else -> KiranaTextMuted
+        val dotColor = when (state) {
+            is AssistantState.Listening   -> KiranaJamaGreen
+            is AssistantState.Processing  -> Color(0xFFFFA000)
+            is AssistantState.Responding  -> KiranaGreenPrimary
+            is AssistantState.Standby     -> KiranaGreenPrimary
+            is AssistantState.Captured    -> KiranaGreenLight
+            is AssistantState.Error       -> KiranaBaakiRed
+            else                          -> KiranaTextMuted
         }
         val statusLabel = when (state) {
-            is AssistantState.Listening -> "सुन रहा है"
-            is AssistantState.Standby -> "सक्रिय (Active)"
-            is AssistantState.Captured -> "प्रोसेसिंग"
-            is AssistantState.Error -> "त्रुटि"
-            else -> "बंद (Off)"
+            is AssistantState.Listening   -> "सुन रहा है"
+            is AssistantState.Processing  -> "प्रोसेसिंग"
+            is AssistantState.Responding  -> "जवाब"
+            is AssistantState.Standby     -> "Active"
+            is AssistantState.Captured    -> "भेज रहा है"
+            is AssistantState.Error       -> "त्रुटि"
+            else                          -> "बंद"
         }
+        val isActive = state !is AssistantState.Stopped
 
         Surface(
             shape = RoundedCornerShape(20.dp),
-            color = if (isServiceActive) KiranaMintPill else KiranaSurface,
-            border = androidx.compose.foundation.BorderStroke(1.dp, if (isServiceActive) KiranaMint else KiranaBorder)
+            color = if (isActive) KiranaMintPill else KiranaSurface,
+            border = androidx.compose.foundation.BorderStroke(1.dp, if (isActive) KiranaMint else KiranaBorder)
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .clip(CircleShape)
-                        .background(statusDotColor)
-                )
+                Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(dotColor))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
                     text = statusLabel,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = if (isServiceActive) KiranaGreenDark else KiranaTextSecondary
+                    color = if (isActive) KiranaGreenDark else KiranaTextSecondary
                 )
             }
         }
     }
 }
 
-// ── Clean Merchant Conversation Card ─────────────────────────────────────────
+// ── Gateway reply card ────────────────────────────────────────────────────────
 
 @Composable
-private fun ConversationCard(
-    state: AssistantState,
-    metadata: AudioCaptureMetadata?
-) {
+private fun GatewayReplyCard(state: AssistantState, metadata: AudioCaptureMetadata?) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -309,86 +274,74 @@ private fun ConversationCard(
         border = androidx.compose.foundation.BorderStroke(1.dp, KiranaBorder)
     ) {
         Column(modifier = Modifier.padding(18.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "नवीनतम लेन-देन (LATEST ACTION)",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 0.8.sp,
-                    color = KiranaTextMuted
-                )
-
-                if (metadata != null) {
-                    Text(
-                        text = "${metadata.durationMs / 1000f}s ऑडियो",
-                        fontSize = 11.sp,
-                        color = KiranaTextMuted
-                    )
-                }
-            }
-
+            Text(
+                text = "नवीनतम जवाब (LATEST REPLY)",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.8.sp,
+                color = KiranaTextMuted
+            )
             Spacer(modifier = Modifier.height(12.dp))
 
-            if (metadata != null) {
-                // Utterance Captured & Understood Area
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        text = "आपने कहा:",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = KiranaTextSecondary
-                    )
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        text = "“रमेश को ₹200 उधार लिखो”",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = KiranaTextPrimary
-                    )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = KiranaMintPill,
-                        border = androidx.compose.foundation.BorderStroke(1.dp, KiranaMint)
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "✓  रमेश के खाते में ₹200 उधार (Baaki) जोड़ दिया गया",
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = KiranaGreenDark
-                            )
-                        }
+            when (state) {
+                is AssistantState.Processing -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), color = KiranaGreenPrimary, strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text("Gateway से जवाब मिल रहा है...", style = MaterialTheme.typography.bodyMedium, color = KiranaTextSecondary)
                     }
                 }
-            } else {
-                // Idle Suggestion Area
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        text = "ऐसे बोलकर देखें:",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = KiranaTextSecondary
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        SuggestionChip(text = "“रमेश ₹200 उधार”", modifier = Modifier.weight(1f))
-                        SuggestionChip(text = "“सुरेश का जमा ₹500”", modifier = Modifier.weight(1f))
+                is AssistantState.Responding -> {
+                    // Transcript
+                    if (state.transcript.isNotBlank()) {
+                        Text("आपने कहा:", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = KiranaTextSecondary)
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text("\"${state.transcript}\"", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = KiranaTextPrimary)
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
+
+                    // Reply
+                    if (state.replyText.isNotBlank()) {
+                        val replyBg = when {
+                            state.ledgerCommitted                           -> KiranaJamaGreenLight
+                            state.replyKind.contains("CONFIRM", ignoreCase = true) -> KiranaMintPill
+                            state.replyKind.contains("UNCLEAR", ignoreCase = true) -> KiranaBaakiRedLight
+                            else                                            -> KiranaMintPill
+                        }
+                        val replyColor = when {
+                            state.ledgerCommitted -> KiranaJamaGreen
+                            state.replyKind.contains("UNCLEAR", ignoreCase = true) -> KiranaBaakiRed
+                            else -> KiranaGreenDark
+                        }
+                        Surface(shape = RoundedCornerShape(12.dp), color = replyBg, border = androidx.compose.foundation.BorderStroke(1.dp, replyBg)) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                if (state.ledgerCommitted) {
+                                    Text("✓ Transaction committed", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = KiranaJamaGreen)
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                }
+                                Text(state.replyText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = replyColor)
+                                if (!state.dialogueState.isNullOrBlank()) {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text("State: ${state.dialogueState}", fontSize = 11.sp, color = KiranaTextMuted)
+                                }
+                            }
+                        }
+                    }
+
+                    if (state.duplicate) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text("(duplicate response — not spoken again)", fontSize = 11.sp, color = KiranaTextMuted)
+                    }
+                }
+
+                else -> {
+                    // Idle suggestion chips — generic voice command examples (no real names)
+                    Text("ऐसे बोलकर देखें:", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = KiranaTextSecondary)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SuggestionChip(text = "\"ग्राहक का ₹200 उधार\"", modifier = Modifier.weight(1f))
+                        SuggestionChip(text = "\"ग्राहक का जमा ₹500\"", modifier = Modifier.weight(1f))
                     }
                 }
             }
@@ -397,31 +350,18 @@ private fun ConversationCard(
 }
 
 @Composable
-private fun SuggestionChip(
-    text: String,
-    modifier: Modifier = Modifier
-) {
+private fun SuggestionChip(text: String, modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(10.dp),
         color = KiranaCreamBg,
         border = androidx.compose.foundation.BorderStroke(1.dp, KiranaBorder)
     ) {
-        Box(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = text,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium,
-                color = KiranaGreenPrimary
-            )
+        Box(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
+            Text(text = text, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = KiranaGreenPrimary)
         }
     }
 }
-
-// ── Clean Permission Notice ──────────────────────────────────────────────────
 
 @Composable
 private fun PermissionNoticeCard(onRequestPermissions: () -> Unit) {
@@ -432,30 +372,19 @@ private fun PermissionNoticeCard(onRequestPermissions: () -> Unit) {
         border = androidx.compose.foundation.BorderStroke(1.dp, KiranaBaakiRed.copy(alpha = 0.2f))
     ) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(14.dp),
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "माइक्रोफ़ोन अनुमति आवश्यक है",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = KiranaBaakiRed
-                )
-                Text(
-                    text = "आवाज़ से हिसाब लिखने के लिए माइक चालू करें",
-                    fontSize = 11.sp,
-                    color = KiranaTextSecondary
-                )
+                Text("माइक्रोफ़ोन अनुमति आवश्यक है", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = KiranaBaakiRed)
+                Text("आवाज़ से हिसाब लिखने के लिए माइक चालू करें", fontSize = 11.sp, color = KiranaTextSecondary)
             }
             Button(
                 onClick = onRequestPermissions,
                 shape = RoundedCornerShape(8.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = KiranaBaakiRed),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
             ) {
                 Text("अनुमति दें", fontSize = 12.sp, color = Color.White)
             }

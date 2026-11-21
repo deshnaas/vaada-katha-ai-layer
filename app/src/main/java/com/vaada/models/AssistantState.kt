@@ -8,6 +8,17 @@ sealed interface AssistantState {
     data object Standby : AssistantState
     data class Listening(val amplitudeRms: Float = 0f) : AssistantState
     data class Captured(val metadata: AudioCaptureMetadata) : AssistantState
+    /** Gateway call in progress; audio already captured and released. */
+    data object Processing : AssistantState
+    /** Gateway returned a reply. Shown until next wake-word cycle. */
+    data class Responding(
+        val transcript: String,
+        val replyText: String,
+        val replyKind: String,
+        val dialogueState: String?,
+        val ledgerCommitted: Boolean,
+        val duplicate: Boolean
+    ) : AssistantState
     data class Error(val message: String) : AssistantState
 }
 
