@@ -1,5 +1,8 @@
 package com.vaada.ui.assistant
 
+import com.vaada.network.formatPaiseAsRupees
+import com.vaada.ui.settings.LanguageSelector
+
 import androidx.compose.animation.*
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
@@ -60,7 +63,9 @@ fun HomeScreen(
             // ── Top bar ───────────────────────────────────────────────────────
             MerchantTopBar(state = state, shopName = shopName)
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(12.dp))
+            LanguageSelector()
+            Spacer(modifier = Modifier.height(16.dp))
 
             if (!hasPermissions) {
                 PermissionNoticeCard(onRequestPermissions = onRequestPermissions)
@@ -121,7 +126,7 @@ fun HomeScreen(
             Spacer(modifier = Modifier.height(28.dp))
 
             // ── Gateway reply card ────────────────────────────────────────────
-            GatewayReplyCard(state = state, metadata = lastMetadata)
+            GatewayReplyCard(state = state, metadata = lastMetadata, onStartRecording = onStartRecording, hasPermissions = hasPermissions)
         }
 
         // ── Push-to-talk button ───────────────────────────────────────────────
@@ -265,7 +270,14 @@ private fun MerchantTopBar(state: AssistantState, shopName: String) {
 // ── Gateway reply card ────────────────────────────────────────────────────────
 
 @Composable
-private fun GatewayReplyCard(state: AssistantState, metadata: AudioCaptureMetadata?) {
+private fun GatewayReplyCard(
+    state: AssistantState,
+    metadata: AudioCaptureMetadata?,
+    onStartRecording: () -> Unit,
+    hasPermissions: Boolean
+) {
+    val isListening = state is AssistantState.Listening
+    val isProcessing = state is AssistantState.Processing
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -329,6 +341,26 @@ private fun GatewayReplyCard(state: AssistantState, metadata: AudioCaptureMetada
                         }
                     }
 
+                    if (!state.notice.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(state.notice, fontSize = 12.sp, color = KiranaTextSecondary)
+                    }
+
+                    // Pending action: shown ONLY from what the gateway reported. Nothing is saved until the
+                    // merchant says "haan"; the buttons below only open the microphone for that spoken answer.
+                    val waiting = state.awaiting == "confirmation" || state.awaiting == "clarification"
+                    if (waiting) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        PendingActionCard(
+                            confirming = state.awaiting == "confirmation",
+                            customer = state.pendingCustomer,
+                            amountPaise = state.pendingAmountPaise,
+                            type = state.pendingType,
+                            onAnswer = onStartRecording,
+                            enabled = !isListening && !isProcessing && hasPermissions
+                        )
+                    }
+
                     if (state.duplicate) {
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("(duplicate response — not spoken again)", fontSize = 11.sp, color = KiranaTextMuted)
@@ -344,6 +376,56 @@ private fun GatewayReplyCard(state: AssistantState, metadata: AudioCaptureMetada
                         SuggestionChip(text = "\"ग्राहक का जमा ₹500\"", modifier = Modifier.weight(1f))
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PendingActionCard(
+    confirming: Boolean,
+    customer: String?,
+    amountPaise: Long?,
+    type: String?,
+    onAnswer: () -> Unit,
+    enabled: Boolean
+) {
+    val typeLabel = when (type) {
+        "CREDIT" -> "उधार (Udhaar)"
+        "PAYMENT" -> "जमा (Payment)"
+        else -> null
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = KiranaSurface),
+        border = androidx.compose.foundation.BorderStroke(1.5.dp, KiranaMintAccent)
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                if (confirming) "⏳ पुष्टि बाकी — अभी सेव नहीं हुआ" else "❓ और जानकारी चाहिए",
+                fontSize = 12.sp, fontWeight = FontWeight.Bold, color = KiranaStatusStandby
+            )
+            if (confirming && amountPaise != null) {
+                Text(formatPaiseAsRupees(amountPaise), fontSize = 30.sp, fontWeight = FontWeight.Bold, color = KiranaTextPrimary)
+                Text(
+                    listOfNotNull(customer, typeLabel).joinToString("  •  "),
+                    fontSize = 14.sp, color = KiranaTextSecondary
+                )
+            }
+            Text(
+                if (confirming) "बोलें: \"haan\" (सेव करने के लिए) या \"cancel kar do\" (रद्द करने के लिए). लगभग 2 मिनट में अपने आप रद्द हो जाता है."
+                else "ऊपर पूछे सवाल का जवाब बोलें.",
+                fontSize = 12.sp, color = KiranaTextSecondary
+            )
+            Button(
+                onClick = onAnswer,
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = KiranaGreenPrimary)
+            ) {
+                Text("🎤  जवाब बोलें", fontSize = 15.sp, color = Color.White)
             }
         }
     }

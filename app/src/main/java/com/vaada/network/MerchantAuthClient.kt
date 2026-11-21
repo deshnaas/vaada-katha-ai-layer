@@ -34,8 +34,9 @@ class MerchantAuthException(
 ) : IOException(message)
 
 class MerchantAuthClient(
-    private val baseUrl: String = "http://10.115.28.169:8000"
+    private val baseUrlOverride: String? = null
 ) {
+    private val baseUrl: String get() = baseUrlOverride ?: com.vaada.config.AppConfig.backendUrl
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)

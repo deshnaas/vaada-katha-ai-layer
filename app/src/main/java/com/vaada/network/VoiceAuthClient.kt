@@ -49,8 +49,9 @@ data class VoiceAuthStatusResult(
 )
 
 class VoiceAuthClient(
-    private val baseUrl: String = "http://10.115.28.169:8100"
+    private val baseUrlOverride: String? = null
 ) {
+    private val baseUrl: String get() = baseUrlOverride ?: com.vaada.config.AppConfig.gatewayUrl
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)

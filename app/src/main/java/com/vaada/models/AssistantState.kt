@@ -17,7 +17,13 @@ sealed interface AssistantState {
         val replyKind: String,
         val dialogueState: String?,
         val ledgerCommitted: Boolean,
-        val duplicate: Boolean
+        val duplicate: Boolean,
+        /** Pending action reported by the gateway (dialogue.pending). Display only; the gateway owns the truth. */
+        val pendingCustomer: String? = null,
+        val pendingAmountPaise: Long? = null,
+        val pendingType: String? = null,
+        val awaiting: String? = null,
+        val notice: String? = null
     ) : AssistantState
     data class Error(val message: String) : AssistantState
 }

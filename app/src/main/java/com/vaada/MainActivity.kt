@@ -46,6 +46,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.vaada.config.AppConfig.init(this)
         enableEdgeToEdge()
         setContent {
             VaadaTheme {

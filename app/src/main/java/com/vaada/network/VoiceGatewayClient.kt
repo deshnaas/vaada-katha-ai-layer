@@ -12,6 +12,8 @@ import java.io.File
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import com.vaada.config.AppConfig
+import com.vaada.config.VoiceLanguage
 
 data class VoiceTurnResult(
     val status: String,
@@ -27,8 +29,22 @@ data class VoiceTurnResult(
     val ledgerBalancePaise: Long?,
     val duplicate: Boolean,
     val audioStatus: String,
-    val audioBase64: String?
+    val audioBase64: String?,
+    // Pending action as reported by the gateway (dialogue.pending); null when nothing is pending.
+    val pendingCustomer: String? = null,
+    val pendingAmountPaise: Long? = null,
+    val pendingType: String? = null,
+    val pendingNeeds: List<String> = emptyList(),
+    val notice: String? = null,
+    val transcriptLanguage: String? = null,
+    val ledgerType: String? = null
 )
+
+private val sharedHttp: OkHttpClient = OkHttpClient.Builder()
+    .connectTimeout(15, TimeUnit.SECONDS)
+    .readTimeout(60, TimeUnit.SECONDS)
+    .writeTimeout(30, TimeUnit.SECONDS)
+    .build()
 
 class VoiceGatewayException(
     val errorCode: String,
@@ -37,21 +53,18 @@ class VoiceGatewayException(
 ) : IOException(message)
 
 class VoiceGatewayClient(
-    private val baseUrl: String = "http://10.115.28.169:8100"
+    private val baseUrl: String = AppConfig.gatewayUrl
 ) {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
+    private val client = sharedHttp
 
     suspend fun sendTurn(
         audioFile: File,
         sessionId: String,
         merchantToken: String,
         clientMsgId: String = UUID.randomUUID().toString(),
-        language: String = "hi-IN,en-IN"
+        language: String = AppConfig.voiceLanguage.code
     ): VoiceTurnResult = withContext(Dispatchers.IO) {
+        require(VoiceLanguage.isValidGatewayValue(language)) { "Unsupported language: $language" }
         require(sessionId.matches(Regex("[A-Za-z0-9_-]{1,64}"))) {
             "Invalid session ID"
         }
@@ -111,6 +124,9 @@ class VoiceGatewayClient(
             val dialogue = json.optJSONObject("dialogue")
             val ledger = json.optJSONObject("ledger")
             val audio = json.optJSONObject("audio")
+            val pending = dialogue?.optJSONObject("pending")
+            val needs = mutableListOf<String>()
+            pending?.optJSONArray("needs")?.let { a -> for (i in 0 until a.length()) needs.add(a.optString(i)) }
 
             val audioStatus = audio?.optString("status", "unavailable") ?: "unavailable"
             val audioBase64 = audio?.optString("data")
@@ -143,7 +159,14 @@ class VoiceGatewayClient(
                 } else null,
                 duplicate = json.optBoolean("duplicate", false),
                 audioStatus = audioStatus,
-                audioBase64 = audioBase64
+                audioBase64 = audioBase64,
+                pendingCustomer = pending?.optString("customer_name")?.takeIf { it.isNotBlank() && it != "null" },
+                pendingAmountPaise = if (pending != null && pending.has("amount_paise") && !pending.isNull("amount_paise")) pending.optLong("amount_paise") else null,
+                pendingType = pending?.optString("transaction_type")?.takeIf { it.isNotBlank() && it != "null" },
+                pendingNeeds = needs,
+                notice = json.optString("notice").takeIf { it.isNotBlank() && it != "null" },
+                transcriptLanguage = transcript?.optString("language_code")?.takeIf { it.isNotBlank() && it != "null" },
+                ledgerType = ledger?.optString("type")?.takeIf { it.isNotBlank() && it != "null" }
             )
         }
     }

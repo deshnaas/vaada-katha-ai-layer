@@ -137,7 +137,8 @@ class VaadaAudioService : Service() {
     private var wakeWordJob: Job? = null
 
     // Voice Gateway
-    private val voiceGatewayClient = VoiceGatewayClient()
+    // Created per use so a changed gateway URL (Settings) takes effect without restarting the service.
+    private val voiceGatewayClient: VoiceGatewayClient get() = VoiceGatewayClient()
     private val voiceAuthClient = VoiceAuthClient()
     private val sessionId: String = UUID.randomUUID().toString()
 
@@ -190,7 +191,7 @@ class VaadaAudioService : Service() {
                             sessionId    = sessionId,
                             merchantToken = currentMerchantToken,
                             clientMsgId  = clientMsgId,
-                            language     = "hi-IN,en-IN"
+                            language     = com.vaada.config.AppConfig.voiceLanguage.code
                         )
                         Log.i(TAG,
                             "Gateway OK | status=${result.status} | transcript=\"${result.transcript}\" " +
@@ -224,7 +225,12 @@ class VaadaAudioService : Service() {
                             replyKind       = result.replyKind,
                             dialogueState   = result.dialogueState,
                             ledgerCommitted = result.ledgerCommitted,
-                            duplicate       = result.duplicate
+                            duplicate       = result.duplicate,
+                            pendingCustomer = result.pendingCustomer,
+                            pendingAmountPaise = result.pendingAmountPaise,
+                            pendingType     = result.pendingType,
+                            awaiting        = result.awaiting,
+                            notice          = result.notice
                         )
                         // Do not replay duplicate replies. Keep wake-word paused while audio plays.
                         if (!result.duplicate && !result.audioBase64.isNullOrBlank()) {
@@ -238,7 +244,8 @@ class VaadaAudioService : Service() {
                         }
                     } catch (e: com.vaada.network.VoiceGatewayException) {
                         Log.e(TAG, "Gateway error [${e.errorCode}]: ${e.message}")
-                        _assistantState.value = AssistantState.Error("Gateway: ${e.message}")
+                        if (com.vaada.network.GatewayErrors.needsLogin(e.errorCode)) setMerchantToken(null)
+                        _assistantState.value = AssistantState.Error(com.vaada.network.GatewayErrors.friendly(e.errorCode, e.message))
                     } catch (e: java.io.IOException) {
                         Log.e(TAG, "Network IO error contacting gateway", e)
                         _assistantState.value = AssistantState.Error("Network error – check connection")

@@ -18,8 +18,9 @@ class KhataApiException(
 
 class KhataApiClient(
     private val sessionToken: String,
-    private val baseUrl: String = "http://10.115.28.169:8000"
+    private val baseUrlOverride: String? = null
 ) {
+    private val baseUrl: String get() = baseUrlOverride ?: com.vaada.config.AppConfig.backendUrl
     private fun get(path: String): String {
         val connection = URL(baseUrl.trimEnd('/') + path)
             .openConnection() as HttpURLConnection

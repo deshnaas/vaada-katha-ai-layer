@@ -63,4 +63,5 @@ dependencies {
 
     debugImplementation(libs.androidx.ui.tooling)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("junit:junit:4.13.2")
 }

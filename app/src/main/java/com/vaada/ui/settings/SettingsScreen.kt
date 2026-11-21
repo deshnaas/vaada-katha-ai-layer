@@ -130,15 +130,18 @@ fun SettingsScreen(
         }
 
         // ── Gateway Config ────────────────────────────────────────────────────
-        SectionCard(title = "Gateway") {
-            StatusRow(label = "Base URL", value = "http://10.115.28.169:8100")
-            StatusRow(label = "Endpoint", value = "POST /v1/voice/turn")
+        SectionCard(title = "Language") {
+            LanguageSelector()
             Text(
-                text = "URL is configured in VoiceGatewayClient.kt. Contact the backend team to change it.",
-                fontSize = 11.sp,
-                color = KiranaTextMuted,
-                modifier = Modifier.padding(top = 6.dp)
+                text = "Replies are shown in Hinglish. Other Indian languages are not offered because the " +
+                    "transaction parser only understands Hindi/Hinglish and English.",
+                fontSize = 11.sp, color = KiranaTextMuted, modifier = Modifier.padding(top = 6.dp)
             )
+        }
+
+        SectionCard(title = "Connection") {
+            ConnectionSettings()
+            StatusRow(label = "Voice endpoint", value = "POST /v1/voice/turn")
         }
 
         // ── App Info ──────────────────────────────────────────────────────────
